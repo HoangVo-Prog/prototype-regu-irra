@@ -12,6 +12,7 @@ def get_args():
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
+    parser.add_argument("--seed", type=int, default=1)
 
     ######################## model general settings ########################
     parser.add_argument("--pretrain_choice", default='ViT-B/16') # whether use pretrained model
@@ -29,6 +30,33 @@ def get_args():
     parser.add_argument("--loss_names", default='sdm+id+mlm', help="which loss to use ['mlm', 'cmpm', 'id', 'itc', 'sdm']")
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
+    parser.add_argument("--prototype", default=False, action='store_true')
+    parser.add_argument("--use_loss_id", default=False, action='store_true')
+    parser.add_argument("--no_pbt", default=False, action='store_true')
+    parser.add_argument("--prototype_feature", default="auto", choices=["auto", "global"])
+    parser.add_argument(
+        "--prototype_projector",
+        default="default",
+        choices=[
+            "default",
+            "identity",
+            "residual_identity",
+            "random_orthogonal",
+            "pca_init",
+            "shared",
+            "shared_pca_init",
+        ],
+    )
+    parser.add_argument("--prototype_residual_scale", type=float, default=0.1)
+    parser.add_argument("--prototype_per_id", type=int, default=4)
+    parser.add_argument("--prototype_dim", type=int, default=512)
+    parser.add_argument("--prototype_kmeans_iters", type=int, default=20)
+    parser.add_argument("--prototype_warmup_epochs", type=int, default=5)
+    parser.add_argument("--prototype_tau", type=float, default=0.07)
+    parser.add_argument("--prototype_hard_k", type=int, default=16)
+    parser.add_argument("--prototype_id_weight", type=float, default=1.0)
+    parser.add_argument("--prototype_momentum", type=float, default=0.2)
+    parser.add_argument("--prototype_lr", type=float, default=None)
     
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))

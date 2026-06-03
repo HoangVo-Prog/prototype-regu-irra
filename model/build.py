@@ -1,5 +1,6 @@
 from model import objectives
 from .clip_model import Transformer, QuickGELU, LayerNorm, build_CLIP_from_openai_pretrained, convert_weights
+from .prototype import PrototypeBranch
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,8 +16,21 @@ class IRRA(nn.Module):
 
         self.base_model, base_cfg = build_CLIP_from_openai_pretrained(args.pretrain_choice, args.img_size, args.stride_size)
         self.embed_dim = base_cfg['embed_dim']
+        self.prototype_enabled = bool(getattr(args, "prototype", False) or getattr(args, "use_loss_id", False))
+        self.prototype_branch = None
 
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
+
+        if self.prototype_enabled:
+            prototype_feature = getattr(args, "prototype_feature", "auto")
+            if prototype_feature not in ("auto", "global"):
+                raise ValueError("IRRA supports prototype_feature 'auto' and 'global'")
+            self.prototype_branch = PrototypeBranch(
+                args=args,
+                num_classes=num_classes,
+                image_dim=self.embed_dim,
+                text_dim=self.embed_dim,
+            )
 
         if 'id' in args.loss_names:
             self.classifier = nn.Linear(self.embed_dim, self.num_classes)
@@ -87,6 +101,20 @@ class IRRA(nn.Module):
         x = self.base_model.encode_text(text)
         return x[torch.arange(x.shape[0]), text.argmax(dim=-1)].float()
 
+    def select_prototype_features(self, outputs, batch):
+        return outputs["image_features"], outputs["text_features"]
+
+    @torch.no_grad()
+    def extract_prototype_features(self, batch):
+        images = batch['images']
+        caption_ids = batch['caption_ids']
+        image_feats, text_feats = self.base_model(images, caption_ids)
+        outputs = {
+            "image_features": image_feats[:, 0, :].float(),
+            "text_features": text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float(),
+        }
+        return self.select_prototype_features(outputs, batch)
+
     def forward(self, batch):
         ret = dict()
 
@@ -96,6 +124,10 @@ class IRRA(nn.Module):
         i_feats = image_feats[:, 0, :].float()
         # i_feats = image_feats.float() # for CLIP ResNet visual model
         t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
+        prototype_outputs = {
+            "image_features": i_feats,
+            "text_features": t_feats,
+        }
 
         logit_scale = self.logit_scale
         ret.update({'temperature': 1 / logit_scale})
@@ -140,6 +172,20 @@ class IRRA(nn.Module):
             acc = (pred[mlm_label_idx] == mlm_labels[mlm_label_idx]).float().mean()
             ret.update({'mlm_acc': acc})
 
+        if self.prototype_branch is not None:
+            proto_image, proto_text = self.select_prototype_features(prototype_outputs, batch)
+            proto_ret = self.prototype_branch(
+                proto_image,
+                proto_text,
+                batch['pids'],
+                use_loss_id=getattr(self.args, "use_loss_id", False),
+            )
+            if "proto_id_loss" in proto_ret:
+                proto_ret["proto_id_loss"] = (
+                    proto_ret["proto_id_loss"] * getattr(self.args, "prototype_id_weight", 1.0)
+                )
+            ret.update(proto_ret)
+
         return ret
 
 
@@ -147,4 +193,6 @@ def build_model(args, num_classes=11003):
     model = IRRA(args, num_classes)
     # covert model to fp16
     convert_weights(model)
+    if getattr(model, "prototype_branch", None) is not None:
+        model.prototype_branch.float()
     return model
