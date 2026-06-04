@@ -33,6 +33,12 @@ def _move_batch_to_device(batch, device):
     return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
 
+def _meter_scalar(value):
+    if torch.is_tensor(value):
+        return value.detach().item()
+    return value
+
+
 def _build_prototype_init_loader(args, train_loader):
     source_dataset = getattr(train_loader.dataset, "dataset", None)
     if source_dataset is None:
@@ -177,15 +183,15 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
             batch_size = batch['images'].shape[0]
             meters['loss'].update(total_loss.item(), batch_size)
-            meters['sdm_loss'].update(ret.get('sdm_loss', 0), batch_size)
-            meters['itc_loss'].update(ret.get('itc_loss', 0), batch_size)
-            meters['id_loss'].update(ret.get('id_loss', 0), batch_size)
-            meters['proto_id_loss'].update(ret.get('proto_id_loss', 0), batch_size)
-            meters['mlm_loss'].update(ret.get('mlm_loss', 0), batch_size)
+            meters['sdm_loss'].update(_meter_scalar(ret.get('sdm_loss', 0)), batch_size)
+            meters['itc_loss'].update(_meter_scalar(ret.get('itc_loss', 0)), batch_size)
+            meters['id_loss'].update(_meter_scalar(ret.get('id_loss', 0)), batch_size)
+            meters['proto_id_loss'].update(_meter_scalar(ret.get('proto_id_loss', 0)), batch_size)
+            meters['mlm_loss'].update(_meter_scalar(ret.get('mlm_loss', 0)), batch_size)
 
-            meters['img_acc'].update(ret.get('img_acc', 0), batch_size)
-            meters['txt_acc'].update(ret.get('txt_acc', 0), batch_size)
-            meters['mlm_acc'].update(ret.get('mlm_acc', 0), 1)
+            meters['img_acc'].update(_meter_scalar(ret.get('img_acc', 0)), batch_size)
+            meters['txt_acc'].update(_meter_scalar(ret.get('txt_acc', 0)), batch_size)
+            meters['mlm_acc'].update(_meter_scalar(ret.get('mlm_acc', 0)), 1)
 
             optimizer.zero_grad()
             total_loss.backward()
