@@ -124,20 +124,22 @@ class IRRA(nn.Module):
         
         if 'mlm' in self.current_task:
             mlm_ids = batch['mlm_ids']
+            mlm_labels = batch['mlm_labels'].reshape(-1)
 
             mlm_feats = self.base_model.encode_text(mlm_ids)
 
             x = self.cross_former(mlm_feats, image_feats, image_feats)
+            x = x.reshape(-1, x.shape[-1])
+            masked = mlm_labels != 0
 
-            x = self.mlm_head(x)  # [batch_size, text_len, num_colors]
+            x = self.mlm_head(x[masked])
 
             scores = x.float().reshape(-1, self.args.vocab_size)
-            mlm_labels = batch['mlm_labels'].reshape(-1)
+            mlm_labels = mlm_labels[masked]
             ret.update({'mlm_loss': objectives.compute_mlm(scores, mlm_labels)*self.args.mlm_loss_weight})
 
             pred = scores.max(1)[1]
-            mlm_label_idx = torch.nonzero(mlm_labels)
-            acc = (pred[mlm_label_idx] == mlm_labels[mlm_label_idx]).float().mean()
+            acc = (pred == mlm_labels).float().mean()
             ret.update({'mlm_acc': acc})
 
         return ret
