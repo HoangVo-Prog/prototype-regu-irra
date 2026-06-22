@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 
 _EPS = 1e-12
+_KMEANS_SIM_CHUNK = 8192
 
 
 def _normalize(features, dim=-1):
@@ -62,6 +63,29 @@ def _copy_pca_components(linear, features):
         linear.bias.zero_()
 
 
+def _chunked_argmax_similarity(features, bank, chunk_size=_KMEANS_SIM_CHUNK):
+    assignments = []
+    for start in range(0, features.shape[0], chunk_size):
+        stop = min(start + chunk_size, features.shape[0])
+        sims = features[start:stop] @ bank.t()
+        assignments.append(sims.argmax(dim=1))
+    return torch.cat(assignments, dim=0)
+
+
+def _pearson_corr(x, y):
+    x = x.float()
+    y = y.float()
+    if x.numel() == 0 or y.numel() == 0 or x.numel() != y.numel():
+        return None
+    x = x - x.mean()
+    y = y - y.mean()
+    x_norm = x.norm()
+    y_norm = y.norm()
+    if x_norm <= _EPS or y_norm <= _EPS:
+        return None
+    return (x * y).sum() / (x_norm * y_norm)
+
+
 def _spherical_kmeans(features, k, num_iters, seed):
     features = _normalize(features)
     n = features.shape[0]
@@ -75,8 +99,7 @@ def _spherical_kmeans(features, k, num_iters, seed):
     centroids = features[perm[:k]].clone()
 
     for _ in range(num_iters):
-        sims = features @ centroids.t()
-        assignments = sims.argmax(dim=1)
+        assignments = _chunked_argmax_similarity(features, centroids)
         next_centroids = centroids.clone()
         for slot in range(k):
             mask = assignments == slot
@@ -226,6 +249,16 @@ class PrototypeMemory(nn.Module):
         local_idx = sims.argmax(dim=1)
         return pids * self.prototypes_per_id + local_idx
 
+    def assign_global(self, features, bank, chunk_size=_KMEANS_SIM_CHUNK):
+        features = _normalize(features)
+        bank = _normalize(bank)
+        assignments = []
+        for start in range(0, features.shape[0], chunk_size):
+            stop = min(start + chunk_size, features.shape[0])
+            sims = features[start:stop] @ bank.t()
+            assignments.append(sims.argmax(dim=1))
+        return torch.cat(assignments, dim=0)
+
     @torch.no_grad()
     def rebuild_translated_banks(self, image_features, text_features, pids):
         image_features = _normalize(image_features)
@@ -269,6 +302,22 @@ class PrototypeMemory(nn.Module):
             mean = _normalize(values[assignments == row].mean(dim=0), dim=0)
             updated = (1.0 - self.momentum) * bank[idx] + self.momentum * mean
             bank[idx].copy_(_normalize(updated, dim=0))
+
+    @torch.no_grad()
+    def prototype_score_matrix(self, text_features, image_features):
+        text_features = _normalize(text_features)
+        image_features = _normalize(image_features)
+        text_assign = self.assign_global(text_features, self.text_prototypes)
+        image_assign = self.assign_global(image_features, self.image_prototypes)
+
+        image_space_query = _normalize(self.text_to_image[text_assign])
+        image_space_gallery = _normalize(self.image_prototypes[image_assign])
+        image_space_scores = image_space_query @ image_space_gallery.t()
+
+        text_space_query = _normalize(self.text_prototypes[text_assign])
+        text_space_gallery = _normalize(self.image_to_text[image_assign])
+        text_space_scores = text_space_query @ text_space_gallery.t()
+        return 0.5 * (image_space_scores + text_space_scores)
 
 
 class PrototypeBranch(nn.Module):
@@ -434,8 +483,13 @@ class PrototypeBranch(nn.Module):
         if not self.is_ready() or payload is None:
             return {}
 
-        image_features = payload["image_features"]
-        text_features = payload["text_features"]
+        host_image_features = payload.get("host_image_feats")
+        host_text_features = payload.get("host_text_feats")
+        proto_image_source = payload.get("proto_image_feats", payload.get("image_features"))
+        proto_text_source = payload.get("proto_text_feats", payload.get("text_features"))
+        image_features, text_features = self.project_for_memory(
+            proto_image_source, proto_text_source
+        )
         pids = payload["pids"].long()
         image_assign = payload.get("image_assign")
         text_assign = payload.get("text_assign")
@@ -471,6 +525,28 @@ class PrototypeBranch(nn.Module):
             if flip_rate is not None:
                 metrics["train/assignment_flip_rate"] = flip_rate
 
+        if host_image_features is not None and host_text_features is not None:
+            host_image_margin = self._host_margin(host_image_features, host_text_features, pids)
+            host_text_margin = self._host_margin(host_text_features, host_image_features, pids)
+            corr = _pearson_corr(
+                torch.cat([image_margin, text_margin]),
+                torch.cat([host_image_margin, host_text_margin]),
+            )
+            if corr is not None:
+                metrics["train/proto_to_host_margin_corr"] = corr
+
+            overlap = self._hard_negative_overlap(
+                host_image_features,
+                host_text_features,
+                pids,
+                image_features,
+                text_features,
+                image_bank,
+                text_bank,
+            )
+            if overlap is not None:
+                metrics["train/hard_negative_overlap"] = overlap
+
         finite_metrics = {}
         for key, value in metrics.items():
             if torch.is_tensor(value) and torch.isfinite(value).all():
@@ -480,6 +556,16 @@ class PrototypeBranch(nn.Module):
     def _margin(self, features, pids, bank):
         sims = _normalize(features) @ _normalize(bank).t()
         same_id = self.memory.proto_pids.view(1, -1).eq(pids.view(-1, 1))
+        pos = sims.masked_fill(~same_id, float("-inf")).max(dim=1).values
+        neg = sims.masked_fill(same_id, float("-inf")).max(dim=1).values
+        no_neg = torch.isinf(neg)
+        if no_neg.any():
+            neg = neg.masked_fill(no_neg, 0.0)
+        return pos - neg
+
+    def _host_margin(self, query_features, gallery_features, pids):
+        sims = _normalize(query_features) @ _normalize(gallery_features).t()
+        same_id = pids.view(-1, 1).eq(pids.view(1, -1))
         pos = sims.masked_fill(~same_id, float("-inf")).max(dim=1).values
         neg = sims.masked_fill(same_id, float("-inf")).max(dim=1).values
         no_neg = torch.isinf(neg)
@@ -541,3 +627,96 @@ class PrototypeBranch(nn.Module):
         if not flips:
             return None
         return torch.tensor(sum(flips) / len(flips))
+
+    def _hard_negative_overlap(
+        self,
+        host_image_features,
+        host_text_features,
+        pids,
+        proto_image_features,
+        proto_text_features,
+        image_bank,
+        text_bank,
+    ):
+        if self.hard_k <= 0:
+            return None
+
+        image_overlap = self._direction_hard_negative_overlap(
+            host_image_features,
+            host_text_features,
+            pids,
+            proto_image_features,
+            image_bank,
+        )
+        text_overlap = self._direction_hard_negative_overlap(
+            host_text_features,
+            host_image_features,
+            pids,
+            proto_text_features,
+            text_bank,
+        )
+        values = [value for value in (image_overlap, text_overlap) if value is not None]
+        if not values:
+            return None
+        return torch.stack(values).mean()
+
+    def _direction_hard_negative_overlap(
+        self,
+        host_query_features,
+        host_gallery_features,
+        pids,
+        proto_query_features,
+        proto_bank,
+    ):
+        host_sets = self._host_negative_identity_sets(host_query_features, host_gallery_features, pids)
+        proto_sets = self._prototype_negative_identity_sets(proto_query_features, proto_bank, pids)
+        overlaps = []
+        for host_ids, proto_ids in zip(host_sets, proto_sets):
+            if not host_ids or not proto_ids:
+                continue
+            union = host_ids | proto_ids
+            if not union:
+                continue
+            overlaps.append(len(host_ids & proto_ids) / float(len(union)))
+        if not overlaps:
+            return None
+        return torch.tensor(sum(overlaps) / len(overlaps), device=proto_query_features.device)
+
+    def _host_negative_identity_sets(self, query_features, gallery_features, pids):
+        sims = _normalize(query_features) @ _normalize(gallery_features).t()
+        same_id = pids.view(-1, 1).eq(pids.view(1, -1))
+        neg_logits = sims.masked_fill(same_id, float("-inf"))
+        num_negatives = neg_logits.shape[1] - int(same_id[0].sum().item())
+        if num_negatives <= 0:
+            return [set() for _ in range(neg_logits.shape[0])]
+        k = min(self.hard_k, num_negatives)
+        topk = neg_logits.topk(k, dim=1).indices
+        pid_rows = pids[topk]
+        return [set(row.tolist()) for row in pid_rows]
+
+    def _prototype_negative_identity_sets(self, features, bank, pids):
+        logits = _normalize(features) @ _normalize(bank).t()
+        same_id = self.memory.proto_pids.view(1, -1).eq(pids.view(-1, 1))
+        neg_logits = logits.masked_fill(same_id, float("-inf"))
+        num_negatives = neg_logits.shape[1] - int(same_id[0].sum().item())
+        if num_negatives <= 0:
+            return [set() for _ in range(neg_logits.shape[0])]
+        k = min(self.hard_k, num_negatives)
+        topk = neg_logits.topk(k, dim=1).indices
+        pid_rows = self.memory.proto_pids[topk]
+        return [set(row.tolist()) for row in pid_rows]
+
+    @torch.no_grad()
+    def score(self, text_features, image_features):
+        image_features, text_features = self.project_for_memory(image_features, text_features)
+        return self.memory.prototype_score_matrix(text_features, image_features)
+
+    def get_checkpoint_metadata(self):
+        return {
+            "prototype_dim": self.prototype_dim,
+            "prototype_per_id": self.memory.prototypes_per_id,
+            "projector_mode": self.mode,
+            "feature_source": getattr(self.args, "prototype_feature", "auto"),
+            "use_pbt": not self.no_pbt,
+            "ready": self.is_ready(),
+        }

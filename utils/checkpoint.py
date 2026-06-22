@@ -34,6 +34,10 @@ class Checkpointer:
 
         data = {}
         data["model"] = self.model.state_dict()
+        model = _unwrap_model(self.model)
+        prototype_branch = getattr(model, "prototype_branch", None)
+        if prototype_branch is not None and hasattr(prototype_branch, "get_checkpoint_metadata"):
+            data["prototype_metadata"] = prototype_branch.get_checkpoint_metadata()
         if self.optimizer is not None:
             data["optimizer"] = self.optimizer.state_dict()
         if self.scheduler is not None:
@@ -74,7 +78,36 @@ class Checkpointer:
         return torch.load(f, map_location=torch.device("cpu"))
 
     def _load_model(self, checkpoint, except_keys=None):
+        prototype_metadata = checkpoint.get("prototype_metadata")
+        if prototype_metadata is not None:
+            self._check_prototype_metadata(prototype_metadata)
         load_state_dict(self.model, checkpoint.pop("model"), except_keys)
+
+    def _check_prototype_metadata(self, metadata):
+        model = _unwrap_model(self.model)
+        prototype_branch = getattr(model, "prototype_branch", None)
+        if prototype_branch is None:
+            return
+
+        logger = logging.getLogger("PersonSearch.checkpoint")
+        checks = {
+            "prototype_dim": prototype_branch.prototype_dim,
+            "prototype_per_id": prototype_branch.memory.prototypes_per_id,
+            "projector_mode": prototype_branch.mode,
+        }
+        for key, current_value in checks.items():
+            saved_value = metadata.get(key)
+            if saved_value is not None and saved_value != current_value:
+                logger.warning(
+                    "Prototype checkpoint metadata mismatch for %s: checkpoint=%s current=%s",
+                    key,
+                    saved_value,
+                    current_value,
+                )
+
+
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
 
 
 def check_key(key, except_keys):

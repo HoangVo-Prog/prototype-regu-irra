@@ -82,6 +82,7 @@ class ImageTextDataset(Dataset):
 
         ret = {
             'pids': pid,
+            'index': index,
             'image_ids': image_id,
             'images': img,
             'caption_ids': tokens,
@@ -158,6 +159,7 @@ class ImageTextMLMDataset(Dataset):
 
         ret = {
             'pids': pid,
+            'index': index,
             'image_ids': image_id,
             'images': img,
             'caption_ids': caption_tokens,

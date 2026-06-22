@@ -126,6 +126,65 @@ class PrototypeBranchTest(unittest.TestCase):
                 text_dim=5,
             )
 
+    def test_score_returns_finite_text_by_image_matrix(self):
+        branch = PrototypeBranch(
+            _args(prototype_projector="identity"), num_classes=3, image_dim=4, text_dim=4
+        )
+        pids = torch.tensor([0, 0, 1, 1, 2, 2])
+        images = torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.9, 0.1, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.1, 0.9, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.9, 0.1],
+            ]
+        )
+        texts = images.roll(shifts=1, dims=1)
+        branch.initialize_projected(images, texts, pids)
+
+        scores = branch.score(texts, images)
+        self.assertEqual(scores.shape, (6, 6))
+        self.assertTrue(torch.isfinite(scores).all())
+
+    def test_compute_diagnostics_reports_extended_metrics(self):
+        branch = PrototypeBranch(
+            _args(prototype_projector="identity"), num_classes=3, image_dim=4, text_dim=4
+        )
+        pids = torch.tensor([0, 0, 1, 1, 2, 2])
+        images = torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.9, 0.1, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.1, 0.9, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.9, 0.1],
+            ]
+        )
+        texts = images.roll(shifts=1, dims=1)
+        branch.initialize_projected(images, texts, pids)
+        image_assign, text_assign = branch.memory.ema_update(images, texts, pids)
+        payload = {
+            "host_image_feats": images,
+            "host_text_feats": texts,
+            "proto_image_feats": images,
+            "proto_text_feats": texts,
+            "pids": pids,
+            "indices": torch.arange(len(pids)),
+            "image_assign": image_assign,
+            "text_assign": text_assign,
+        }
+
+        state = {}
+        first = branch.compute_diagnostics(payload, state=state)
+        second = branch.compute_diagnostics(payload, state=state)
+
+        self.assertIn("train/proto_to_host_margin_corr", first)
+        self.assertIn("train/hard_negative_overlap", first)
+        self.assertIn("train/assignment_flip_rate", second)
+
 
 if __name__ == "__main__":
     unittest.main()

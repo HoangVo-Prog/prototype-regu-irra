@@ -186,6 +186,17 @@ class IRRA(nn.Module):
                 proto_ret["proto_id_loss"] = (
                     proto_ret["proto_id_loss"] * getattr(self.args, "prototype_id_weight", 1.0)
                 )
+            if "_proto_diag" in proto_ret:
+                proto_ret["_proto_diag"].update(
+                    {
+                        "host_image_feats": i_feats.detach(),
+                        "host_text_feats": t_feats.detach(),
+                        "proto_image_feats": proto_image.detach(),
+                        "proto_text_feats": proto_text.detach(),
+                        "pids": batch["pids"].detach(),
+                        "indices": batch.get("index").detach() if "index" in batch else None,
+                    }
+                )
             ret.update(proto_ret)
 
         return ret

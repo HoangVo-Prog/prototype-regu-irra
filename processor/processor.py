@@ -39,6 +39,23 @@ def _meter_scalar(value):
     return value
 
 
+def _loss_grad_norm(loss, params):
+    params = [param for param in params if param.requires_grad]
+    if not params:
+        return 0.0
+
+    grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    total = None
+    for grad in grads:
+        if grad is None:
+            continue
+        value = grad.detach().float().pow(2).sum()
+        total = value if total is None else total + value
+    if total is None:
+        return 0.0
+    return float(total.sqrt().cpu().item())
+
+
 def _build_prototype_init_loader(args, train_loader):
     source_dataset = getattr(train_loader.dataset, "dataset", None)
     if source_dataset is None:
@@ -101,6 +118,35 @@ def _broadcast_prototype_branch(branch):
         dist.broadcast(tensor, src=0)
 
 
+def _validate_prototype_init(branch, init_loader, image_features, text_features, pids, image_projected, text_projected):
+    expected_samples = len(init_loader.dataset)
+    if image_features.shape[0] != expected_samples or text_features.shape[0] != expected_samples:
+        raise RuntimeError(
+            "Prototype init loader scan mismatch: expected {} samples but saw image={} text={}".format(
+                expected_samples, image_features.shape[0], text_features.shape[0]
+            )
+        )
+    if pids.shape[0] != expected_samples:
+        raise RuntimeError(
+            "Prototype init loader scan mismatch: expected {} pid rows but saw {}".format(
+                expected_samples, pids.shape[0]
+            )
+        )
+
+    unique = torch.unique(pids.cpu()).sort().values
+    expected_pids = torch.arange(branch.memory.num_classes, dtype=unique.dtype)
+    if unique.numel() != expected_pids.numel() or not torch.equal(unique, expected_pids):
+        raise RuntimeError("Prototype init loader must observe every contiguous train identity exactly once or more")
+
+    expected_shape = (expected_samples, branch.prototype_dim)
+    if tuple(image_projected.shape) != expected_shape or tuple(text_projected.shape) != expected_shape:
+        raise RuntimeError(
+            "Projected prototype features must match {} but got image={} text={}".format(
+                expected_shape, tuple(image_projected.shape), tuple(text_projected.shape)
+            )
+        )
+
+
 def maybe_initialize_prototypes(args, model, train_loader, device, logger):
     if not _prototype_requested(args) or _prototype_ready(model):
         return
@@ -121,6 +167,15 @@ def maybe_initialize_prototypes(args, model, train_loader, device, logger):
             device,
             chunk_size=getattr(args, "test_batch_size", args.batch_size),
         )
+        _validate_prototype_init(
+            branch,
+            init_loader,
+            image_features,
+            text_features,
+            pids,
+            image_projected,
+            text_projected,
+        )
         branch.initialize_projected(image_projected, text_projected, pids.to(device))
         logger.info(
             "Prototype memory initialized with {} samples and {} identities".format(
@@ -133,7 +188,7 @@ def maybe_initialize_prototypes(args, model, train_loader, device, logger):
 
 
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
-             scheduler, checkpointer):
+             scheduler, checkpointer, wandb_logger=None):
 
     log_period = args.log_period
     eval_period = args.eval_period
@@ -163,95 +218,149 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     best_top1 = 0.0
     prototype_diagnostic_state = {}
 
-    # train
-    for epoch in range(start_epoch, num_epoch + 1):
-        start_time = time.time()
-        for meter in meters.values():
-            meter.reset()
-        model.train()
-        if epoch > getattr(args, "prototype_warmup_epochs", 5):
-            maybe_initialize_prototypes(args, model, train_loader, device, logger)
+    try:
+        for epoch in range(start_epoch, num_epoch + 1):
+            start_time = time.time()
+            for meter in meters.values():
+                meter.reset()
             model.train()
+            if epoch > getattr(args, "prototype_warmup_epochs", 5):
+                maybe_initialize_prototypes(args, model, train_loader, device, logger)
+                model.train()
 
-        for n_iter, batch in enumerate(train_loader):
-            batch = _move_batch_to_device(batch, device)
+            for n_iter, batch in enumerate(train_loader):
+                batch = _move_batch_to_device(batch, device)
 
-            ret = model(batch)
-            proto_diag = ret.pop("_proto_diag", None)
-            total_loss = sum([v for k, v in ret.items() if "loss" in k])
-            arguments["iteration"] += 1
+                ret = model(batch)
+                proto_diag = ret.pop("_proto_diag", None)
+                total_loss = sum([v for k, v in ret.items() if "loss" in k])
+                arguments["iteration"] += 1
 
-            batch_size = batch['images'].shape[0]
-            meters['loss'].update(total_loss.item(), batch_size)
-            meters['sdm_loss'].update(_meter_scalar(ret.get('sdm_loss', 0)), batch_size)
-            meters['itc_loss'].update(_meter_scalar(ret.get('itc_loss', 0)), batch_size)
-            meters['id_loss'].update(_meter_scalar(ret.get('id_loss', 0)), batch_size)
-            meters['proto_id_loss'].update(_meter_scalar(ret.get('proto_id_loss', 0)), batch_size)
-            meters['mlm_loss'].update(_meter_scalar(ret.get('mlm_loss', 0)), batch_size)
+                batch_size = batch['images'].shape[0]
+                meters['loss'].update(total_loss.item(), batch_size)
+                meters['sdm_loss'].update(_meter_scalar(ret.get('sdm_loss', 0)), batch_size)
+                meters['itc_loss'].update(_meter_scalar(ret.get('itc_loss', 0)), batch_size)
+                meters['id_loss'].update(_meter_scalar(ret.get('id_loss', 0)), batch_size)
+                meters['proto_id_loss'].update(_meter_scalar(ret.get('proto_id_loss', 0)), batch_size)
+                meters['mlm_loss'].update(_meter_scalar(ret.get('mlm_loss', 0)), batch_size)
 
-            meters['img_acc'].update(_meter_scalar(ret.get('img_acc', 0)), batch_size)
-            meters['txt_acc'].update(_meter_scalar(ret.get('txt_acc', 0)), batch_size)
-            meters['mlm_acc'].update(_meter_scalar(ret.get('mlm_acc', 0)), 1)
+                meters['img_acc'].update(_meter_scalar(ret.get('img_acc', 0)), batch_size)
+                meters['txt_acc'].update(_meter_scalar(ret.get('txt_acc', 0)), batch_size)
+                meters['mlm_acc'].update(_meter_scalar(ret.get('mlm_acc', 0)), 1)
 
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
-            synchronize()
-
-            if (n_iter + 1) % log_period == 0:
-                proto_metrics = {}
                 branch = _prototype_branch(model)
-                if branch is not None and proto_diag is not None:
-                    proto_metrics = branch.compute_diagnostics(
-                        proto_diag, state=prototype_diagnostic_state
+                proto_grad_norm = None
+                if (
+                    branch is not None
+                    and "proto_id_loss" in ret
+                    and ret["proto_id_loss"].requires_grad
+                    and (n_iter + 1) % log_period == 0
+                ):
+                    proto_grad_norm = _loss_grad_norm(
+                        ret["proto_id_loss"],
+                        list(branch.parameters()),
                     )
-                    for metric_key, metric_value in proto_metrics.items():
-                        tb_writer.add_scalar(metric_key, metric_value, arguments["iteration"])
 
-                info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
-                # log loss and acc info
-                for k, v in meters.items():
-                    if v.avg > 0:
-                        info_str += f", {k}: {v.avg:.4f}"
-                for k, v in proto_metrics.items():
-                    info_str += f", {k.split('/')[-1]}: {v:.4f}"
-                info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
-                logger.info(info_str)
-        
-        tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
-        tb_writer.add_scalar('temperature', ret['temperature'], epoch)
-        for k, v in meters.items():
-            if v.avg > 0:
-                tb_writer.add_scalar(k, v.avg, epoch)
-        if meters["proto_id_loss"].avg > 0:
-            tb_writer.add_scalar(
-                "train/weighted_loss/proto_id_loss", meters["proto_id_loss"].avg, epoch
-            )
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+                synchronize()
 
+                if (n_iter + 1) % log_period == 0:
+                    proto_metrics = {}
+                    if branch is not None and proto_diag is not None:
+                        proto_metrics = branch.compute_diagnostics(
+                            proto_diag, state=prototype_diagnostic_state
+                        )
+                        for metric_key, metric_value in proto_metrics.items():
+                            tb_writer.add_scalar(metric_key, metric_value, arguments["iteration"])
 
-        scheduler.step()
-        if get_rank() == 0:
-            end_time = time.time()
-            time_per_batch = (end_time - start_time) / (n_iter + 1)
-            logger.info(
-                "Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]"
-                .format(epoch, time_per_batch,
-                        train_loader.batch_size / time_per_batch))
-        if epoch % eval_period == 0:
+                    iter_metrics = {
+                        "train/total_loss": float(total_loss.detach().item()),
+                        "train/lr": float(scheduler.get_lr()[0]),
+                        "train/lr_min": float(min(group["lr"] for group in optimizer.param_groups)),
+                        "train/lr_max": float(max(group["lr"] for group in optimizer.param_groups)),
+                    }
+                    for loss_key in ("sdm_loss", "itc_loss", "id_loss", "proto_id_loss", "mlm_loss"):
+                        if loss_key in ret:
+                            iter_metrics["train/weighted_loss/{}".format(loss_key)] = float(
+                                ret[loss_key].detach().item()
+                            )
+                    if proto_grad_norm is not None:
+                        iter_metrics["train/loss_grad_norm/proto_id_loss"] = proto_grad_norm
+                        tb_writer.add_scalar(
+                            "train/loss_grad_norm/proto_id_loss",
+                            proto_grad_norm,
+                            arguments["iteration"],
+                        )
+                    if "proto_id_loss" in ret:
+                        tb_writer.add_scalar(
+                            "train/weighted_loss/proto_id_loss",
+                            float(ret["proto_id_loss"].detach().item()),
+                            arguments["iteration"],
+                        )
+                    iter_metrics.update(proto_metrics)
+                    if wandb_logger is not None:
+                        wandb_logger.log(iter_metrics, step=arguments["iteration"])
+
+                    info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
+                    for k, v in meters.items():
+                        if v.avg > 0:
+                            info_str += f", {k}: {v.avg:.4f}"
+                    for k, v in proto_metrics.items():
+                        info_str += f", {k.split('/')[-1]}: {v:.4f}"
+                    if proto_grad_norm is not None:
+                        info_str += f", proto_grad_norm: {proto_grad_norm:.4f}"
+                    info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
+                    logger.info(info_str)
+
+            tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
+            tb_writer.add_scalar('temperature', ret['temperature'], epoch)
+            for k, v in meters.items():
+                if v.avg > 0:
+                    tb_writer.add_scalar(k, v.avg, epoch)
+            if meters["proto_id_loss"].avg > 0:
+                tb_writer.add_scalar(
+                    "train/weighted_loss/proto_id_loss", meters["proto_id_loss"].avg, epoch
+                )
+
+            epoch_metrics = {
+                "train/lr": float(scheduler.get_lr()[0]),
+                "train/lr_min": float(min(group["lr"] for group in optimizer.param_groups)),
+                "train/lr_max": float(max(group["lr"] for group in optimizer.param_groups)),
+                "train/total_loss_epoch": float(meters["loss"].avg),
+            }
+            for meter_key, meter in meters.items():
+                if meter.avg > 0:
+                    epoch_metrics["train/epoch_avg/{}".format(meter_key)] = float(meter.avg)
+            if wandb_logger is not None:
+                wandb_logger.log(epoch_metrics, step=arguments["iteration"])
+
+            scheduler.step()
             if get_rank() == 0:
-                logger.info("Validation Results - Epoch: {}".format(epoch))
-                if args.distributed:
-                    top1 = evaluator.eval(model.module.eval())
-                else:
-                    top1 = evaluator.eval(model.eval())
+                end_time = time.time()
+                time_per_batch = (end_time - start_time) / (n_iter + 1)
+                logger.info(
+                    "Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]"
+                    .format(epoch, time_per_batch,
+                            train_loader.batch_size / time_per_batch))
+            if epoch % eval_period == 0:
+                if get_rank() == 0:
+                    logger.info("Validation Results - Epoch: {}".format(epoch))
+                    if args.distributed:
+                        top1 = evaluator.eval(model.module.eval())
+                    else:
+                        top1 = evaluator.eval(model.eval())
 
-                torch.cuda.empty_cache()
-                if best_top1 < top1:
-                    best_top1 = top1
-                    arguments["epoch"] = epoch
-                    checkpointer.save("best", **arguments)
-    if get_rank() == 0:
-        logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
+                    torch.cuda.empty_cache()
+                    if best_top1 < top1:
+                        best_top1 = top1
+                        arguments["epoch"] = epoch
+                        checkpointer.save("best", **arguments)
+        if get_rank() == 0:
+            logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
+    finally:
+        tb_writer.close()
 
 
 def do_inference(model, test_img_loader, test_txt_loader):

@@ -13,6 +13,12 @@ def get_args():
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--wandb", default=False, action='store_true')
+    parser.add_argument("--wandb_project", default="prototype-regu-irra")
+    parser.add_argument("--wandb_entity", default=None)
+    parser.add_argument("--wandb_name", default="")
+    parser.add_argument("--wandb_tags", default="")
+    parser.add_argument("--wandb_mode", default="online", choices=["online", "offline", "disabled"])
 
     ######################## model general settings ########################
     parser.add_argument("--pretrain_choice", default='ViT-B/16') # whether use pretrained model
