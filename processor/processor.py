@@ -190,8 +190,8 @@ def maybe_initialize_prototypes(args, model, train_loader, device, logger):
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer, wandb_logger=None):
 
-    log_period = args.log_period
-    eval_period = args.eval_period
+    log_period = int(args.log_period)
+    eval_period = int(args.eval_period)
     device = "cuda"
     num_epoch = args.num_epoch
     arguments = {}
