@@ -72,8 +72,7 @@ class Evaluator():
 
         return qfeats, gfeats, qids, gids
     
-    def eval(self, model, i2t_metric=False):
-
+    def eval_metrics(self, model, i2t_metric=False):
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
 
         qfeats = F.normalize(qfeats, p=2, dim=1) # text features
@@ -85,11 +84,27 @@ class Evaluator():
         t2i_cmc, t2i_mAP, t2i_mINP = t2i_cmc.numpy(), t2i_mAP.numpy(), t2i_mINP.numpy()
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP"])
         table.add_row(['t2i', t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP])
+        metrics = {
+            "eval/t2i_R1": float(t2i_cmc[0]),
+            "eval/t2i_R5": float(t2i_cmc[4]),
+            "eval/t2i_R10": float(t2i_cmc[9]),
+            "eval/t2i_mAP": float(t2i_mAP),
+            "eval/t2i_mINP": float(t2i_mINP),
+        }
 
         if i2t_metric:
             i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=similarity.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
             i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
             table.add_row(['i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP])
+            metrics.update(
+                {
+                    "eval/i2t_R1": float(i2t_cmc[0]),
+                    "eval/i2t_R5": float(i2t_cmc[4]),
+                    "eval/i2t_R10": float(i2t_cmc[9]),
+                    "eval/i2t_mAP": float(i2t_mAP),
+                    "eval/i2t_mINP": float(i2t_mINP),
+                }
+            )
         # table.float_format = '.4'
         table.custom_format["R1"] = lambda f, v: f"{v:.3f}"
         table.custom_format["R5"] = lambda f, v: f"{v:.3f}"
@@ -97,5 +112,8 @@ class Evaluator():
         table.custom_format["mAP"] = lambda f, v: f"{v:.3f}"
         table.custom_format["mINP"] = lambda f, v: f"{v:.3f}"
         self.logger.info('\n' + str(table))
-        
-        return t2i_cmc[0]
+        return metrics
+
+    def eval(self, model, i2t_metric=False):
+        metrics = self.eval_metrics(model, i2t_metric=i2t_metric)
+        return metrics["eval/t2i_R1"]

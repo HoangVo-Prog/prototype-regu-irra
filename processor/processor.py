@@ -348,15 +348,22 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 if get_rank() == 0:
                     logger.info("Validation Results - Epoch: {}".format(epoch))
                     if args.distributed:
-                        top1 = evaluator.eval(model.module.eval())
+                        eval_metrics = evaluator.eval_metrics(model.module.eval())
                     else:
-                        top1 = evaluator.eval(model.eval())
+                        eval_metrics = evaluator.eval_metrics(model.eval())
+                    top1 = eval_metrics["eval/t2i_R1"]
+                    eval_metrics["eval/top1"] = top1
 
                     torch.cuda.empty_cache()
                     if best_top1 < top1:
                         best_top1 = top1
                         arguments["epoch"] = epoch
                         checkpointer.save("best", **arguments)
+                    eval_metrics["eval/best_top1"] = float(best_top1)
+                    for metric_key, metric_value in eval_metrics.items():
+                        tb_writer.add_scalar(metric_key, metric_value, epoch)
+                    if wandb_logger is not None:
+                        wandb_logger.log(eval_metrics, step=arguments["iteration"])
         if get_rank() == 0:
             logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
     finally:
