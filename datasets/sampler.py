@@ -14,10 +14,12 @@ class RandomIdentitySampler(Sampler):
     - batch_size (int): number of examples in a batch.
     """
 
-    def __init__(self, data_source, batch_size, num_instances):
+    def __init__(self, data_source, batch_size, num_instances, seed=0):
         self.data_source = data_source
         self.batch_size = batch_size
         self.num_instances = num_instances
+        self.seed = int(seed)
+        self.epoch = 0
         self.num_pids_per_batch = self.batch_size // self.num_instances
         self.index_dic = defaultdict(list) #dict with list value
         #{783: [0, 5, 116, 876, 1554, 2041],...,}
@@ -34,14 +36,21 @@ class RandomIdentitySampler(Sampler):
                 num = self.num_instances
             self.length += num - num % self.num_instances
 
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
     def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        np_rng = np.random.RandomState(self.seed + self.epoch)
         batch_idxs_dict = defaultdict(list)
 
         for pid in self.pids:
             idxs = copy.deepcopy(self.index_dic[pid])
             if len(idxs) < self.num_instances:
-                idxs = np.random.choice(idxs, size=self.num_instances, replace=True)
-            random.shuffle(idxs)
+                idxs = np_rng.choice(idxs, size=self.num_instances, replace=True).tolist()
+            else:
+                idxs = list(idxs)
+            rng.shuffle(idxs)
             batch_idxs = []
             for idx in idxs:
                 batch_idxs.append(idx)
@@ -53,7 +62,7 @@ class RandomIdentitySampler(Sampler):
         final_idxs = []
 
         while len(avai_pids) >= self.num_pids_per_batch:
-            selected_pids = random.sample(avai_pids, self.num_pids_per_batch)
+            selected_pids = rng.sample(avai_pids, self.num_pids_per_batch)
             for pid in selected_pids:
                 batch_idxs = batch_idxs_dict[pid].pop(0)
                 final_idxs.extend(batch_idxs)
@@ -64,4 +73,3 @@ class RandomIdentitySampler(Sampler):
 
     def __len__(self):
         return self.length
-

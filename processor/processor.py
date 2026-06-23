@@ -9,7 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from prettytable import PrettyTable
 from datasets.bases import ImageTextDataset
-from datasets.build import build_transforms, collate
+from datasets.build import build_transforms, collate, make_data_loader_generator, seed_worker
 
 
 def _unwrap_model(model):
@@ -31,6 +31,17 @@ def _prototype_ready(model):
 
 def _move_batch_to_device(batch, device):
     return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+
+def _set_epoch_on_loader(loader, epoch):
+    sampler = getattr(loader, "sampler", None)
+    if sampler is not None and hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    inner_sampler = getattr(batch_sampler, "sampler", None)
+    if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
+        inner_sampler.set_epoch(epoch)
 
 
 def _meter_scalar(value):
@@ -57,7 +68,8 @@ def _loss_grad_norm(loss, params):
 
 
 def _build_prototype_init_loader(args, train_loader):
-    source_dataset = getattr(train_loader.dataset, "dataset", None)
+    train_set = getattr(train_loader, "dataset", None)
+    source_dataset = getattr(train_set, "dataset", None)
     if source_dataset is None:
         raise RuntimeError("Cannot build prototype init loader from this train dataset")
 
@@ -65,7 +77,8 @@ def _build_prototype_init_loader(args, train_loader):
     init_set = ImageTextDataset(
         source_dataset,
         transform=transforms,
-        text_length=args.text_length,
+        text_length=getattr(train_set, "text_length", args.text_length),
+        truncate=getattr(train_set, "truncate", True),
     )
     return DataLoader(
         init_set,
@@ -73,6 +86,8 @@ def _build_prototype_init_loader(args, train_loader):
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate,
+        worker_init_fn=seed_worker,
+        generator=make_data_loader_generator(args, offset=4000),
     )
 
 
@@ -105,8 +120,8 @@ def _project_prototype_features(branch, image_features, text_features, device, c
         image_chunk = image_features[start:stop].to(device)
         text_chunk = text_features[start:stop].to(device)
         image_projected, text_projected = branch.project_for_memory(image_chunk, text_chunk)
-        projected_images.append(image_projected.detach())
-        projected_texts.append(text_projected.detach())
+        projected_images.append(image_projected.detach().cpu())
+        projected_texts.append(text_projected.detach().cpu())
     return torch.cat(projected_images, dim=0), torch.cat(projected_texts, dim=0)
 
 
@@ -176,7 +191,7 @@ def maybe_initialize_prototypes(args, model, train_loader, device, logger):
             image_projected,
             text_projected,
         )
-        branch.initialize_projected(image_projected, text_projected, pids.to(device))
+        branch.initialize_projected(image_projected, text_projected, pids)
         logger.info(
             "Prototype memory initialized with {} samples and {} identities".format(
                 pids.numel(), branch.memory.num_classes
@@ -223,6 +238,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             start_time = time.time()
             for meter in meters.values():
                 meter.reset()
+            _set_epoch_on_loader(train_loader, epoch)
             model.train()
             if epoch > getattr(args, "prototype_warmup_epochs", 5):
                 maybe_initialize_prototypes(args, model, train_loader, device, logger)

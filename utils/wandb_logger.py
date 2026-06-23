@@ -45,10 +45,14 @@ def init_wandb(args, distributed_rank=0, logger=None):
     if isinstance(tags, str):
         tags = [tag.strip() for tag in tags.split(",") if tag.strip()]
 
+    run_name = getattr(args, "wandb_name", None)
+    if not run_name:
+        run_name = getattr(args, "run_timestamp", None) or getattr(args, "name", None)
+
     run = wandb.init(
         project=getattr(args, "wandb_project", None),
         entity=getattr(args, "wandb_entity", None),
-        name=getattr(args, "wandb_name", None) or getattr(args, "name", None),
+        name=run_name,
         tags=tags or None,
         mode=getattr(args, "wandb_mode", "online"),
         config=vars(args),

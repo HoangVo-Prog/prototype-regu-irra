@@ -13,6 +13,8 @@ def get_args():
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--deterministic", default=True, action='store_true',
+                        help="enable deterministic training settings for reproducible runs")
     parser.add_argument("--wandb", default=False, action='store_true')
     parser.add_argument("--wandb_project", default="prototype-regu-irra")
     parser.add_argument("--wandb_entity", default=None)

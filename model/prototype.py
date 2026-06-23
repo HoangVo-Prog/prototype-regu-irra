@@ -133,8 +133,9 @@ def identity_spherical_kmeans(features, pids, num_classes, prototypes_per_id, nu
 
 def _direction_identity_loss(features, prototypes, proto_pids, pids, tau, hard_k):
     features = _normalize(features)
-    prototypes = _normalize(prototypes)
-    pids = pids.long()
+    prototypes = _normalize(prototypes.to(features.device))
+    proto_pids = proto_pids.to(features.device)
+    pids = pids.long().to(features.device)
 
     logits = features @ prototypes.t()
     logits = logits / tau
@@ -243,7 +244,7 @@ class PrototypeMemory(nn.Module):
     def assign_identity(self, features, pids, bank):
         features = _normalize(features)
         pids = pids.to(features.device).long()
-        bank = _normalize(bank).view(self.num_classes, self.prototypes_per_id, self.dim)
+        bank = _normalize(bank.to(features.device)).view(self.num_classes, self.prototypes_per_id, self.dim)
         local_bank = bank[pids]
         sims = torch.bmm(local_bank, features.unsqueeze(-1)).squeeze(-1)
         local_idx = sims.argmax(dim=1)
@@ -251,7 +252,7 @@ class PrototypeMemory(nn.Module):
 
     def assign_global(self, features, bank, chunk_size=_KMEANS_SIM_CHUNK):
         features = _normalize(features)
-        bank = _normalize(bank)
+        bank = _normalize(bank.to(features.device))
         assignments = []
         for start in range(0, features.shape[0], chunk_size):
             stop = min(start + chunk_size, features.shape[0])
