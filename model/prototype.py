@@ -31,21 +31,13 @@ class ResidualIdentityProjector(nn.Module):
         return features + self.scale * self.residual(features)
 
 
-def _linear(in_dim, out_dim):
+def _linear_projector(in_dim, out_dim, orthogonal=False, zero_bias=False):
     layer = nn.Linear(in_dim, out_dim)
-    nn.init.normal_(layer.weight, std=0.02)
-    nn.init.zeros_(layer.bias)
-    return layer
-
-
-def _default_projector(in_dim, out_dim):
-    return nn.Sequential(_linear(in_dim, out_dim), nn.LayerNorm(out_dim))
-
-
-def _orthogonal_projector(in_dim, out_dim):
-    layer = nn.Linear(in_dim, out_dim)
-    nn.init.orthogonal_(layer.weight)
-    nn.init.zeros_(layer.bias)
+    if orthogonal:
+        nn.init.orthogonal_(layer.weight)
+        nn.init.zeros_(layer.bias)
+    elif zero_bias:
+        nn.init.zeros_(layer.bias)
     return layer
 
 
@@ -86,15 +78,21 @@ def _pearson_corr(x, y):
     return (x * y).sum() / (x_norm * y_norm)
 
 
-def _spherical_kmeans(features, k, num_iters, seed):
+def _make_generator(device, seed):
+    if seed is None:
+        return None
+    generator = torch.Generator() if device.type == "cpu" else torch.Generator(device=device.type)
+    generator.manual_seed(int(seed))
+    return generator
+
+
+def _spherical_kmeans(features, k, num_iters, generator=None):
     features = _normalize(features)
     n = features.shape[0]
     if n <= k:
         repeats = int(math.ceil(float(k) / float(n)))
         return _normalize(features.repeat((repeats, 1))[:k])
 
-    generator = torch.Generator()
-    generator.manual_seed(int(seed))
     perm = torch.randperm(n, generator=generator).to(features.device)
     centroids = features[perm[:k]].clone()
 
@@ -113,6 +111,7 @@ def _spherical_kmeans(features, k, num_iters, seed):
 def identity_spherical_kmeans(features, pids, num_classes, prototypes_per_id, num_iters, seed):
     features = _normalize(features)
     pids = pids.long()
+    generator = _make_generator(features.device, seed)
     banks = []
     for pid in range(num_classes):
         mask = pids == pid
@@ -125,7 +124,7 @@ def identity_spherical_kmeans(features, pids, num_classes, prototypes_per_id, nu
                 features[mask],
                 prototypes_per_id,
                 num_iters=num_iters,
-                seed=int(seed) + pid,
+                generator=generator,
             )
         )
     return torch.cat(banks, dim=0)
@@ -217,6 +216,7 @@ class PrototypeMemory(nn.Module):
         text_features = _normalize(text_features)
         pids = pids.to(image_features.device).long()
         self._validate_pids(pids)
+        text_seed = None if seed is None else int(seed) + 1
 
         self.image_prototypes.copy_(
             identity_spherical_kmeans(
@@ -225,7 +225,7 @@ class PrototypeMemory(nn.Module):
                 self.num_classes,
                 self.prototypes_per_id,
                 num_iters,
-                int(seed) + 1000,
+                seed,
             )
         )
         self.text_prototypes.copy_(
@@ -235,7 +235,7 @@ class PrototypeMemory(nn.Module):
                 self.num_classes,
                 self.prototypes_per_id,
                 num_iters,
-                int(seed) + 1001,
+                text_seed,
             )
         )
         self.rebuild_translated_banks(image_features, text_features, pids)
@@ -353,8 +353,14 @@ class PrototypeBranch(nn.Module):
 
     def _build_projectors(self, residual_scale):
         if self.mode == "default":
-            self.image_projector = _default_projector(self.image_dim, self.prototype_dim)
-            self.text_projector = _default_projector(self.text_dim, self.prototype_dim)
+            self.image_projector = nn.Sequential(
+                _linear_projector(self.image_dim, self.prototype_dim),
+                nn.LayerNorm(self.prototype_dim),
+            )
+            self.text_projector = nn.Sequential(
+                _linear_projector(self.text_dim, self.prototype_dim),
+                nn.LayerNorm(self.prototype_dim),
+            )
         elif self.mode == "identity":
             self._require_equal_dims(self.prototype_dim)
             self.image_projector = IdentityProjector()
@@ -364,19 +370,19 @@ class PrototypeBranch(nn.Module):
             self.image_projector = ResidualIdentityProjector(self.image_dim, residual_scale)
             self.text_projector = ResidualIdentityProjector(self.text_dim, residual_scale)
         elif self.mode == "random_orthogonal":
-            self.image_projector = _orthogonal_projector(self.image_dim, self.prototype_dim)
-            self.text_projector = _orthogonal_projector(self.text_dim, self.prototype_dim)
+            self.image_projector = _linear_projector(self.image_dim, self.prototype_dim, orthogonal=True)
+            self.text_projector = _linear_projector(self.text_dim, self.prototype_dim, orthogonal=True)
         elif self.mode == "pca_init":
             self._require_pca_dims()
-            self.image_projector = nn.Linear(self.image_dim, self.prototype_dim)
-            self.text_projector = nn.Linear(self.text_dim, self.prototype_dim)
+            self.image_projector = _linear_projector(self.image_dim, self.prototype_dim, zero_bias=True)
+            self.text_projector = _linear_projector(self.text_dim, self.prototype_dim, zero_bias=True)
         elif self.mode == "shared":
             self._require_shared_dims()
-            self.shared_projector = _default_projector(self.image_dim, self.prototype_dim)
+            self.shared_projector = _linear_projector(self.image_dim, self.prototype_dim)
         elif self.mode == "shared_pca_init":
             self._require_shared_dims()
             self._require_pca_dims()
-            self.shared_projector = nn.Linear(self.image_dim, self.prototype_dim)
+            self.shared_projector = _linear_projector(self.image_dim, self.prototype_dim, zero_bias=True)
         else:
             raise ValueError("Unsupported prototype_projector: {}".format(self.mode))
 
@@ -422,12 +428,15 @@ class PrototypeBranch(nn.Module):
 
     @torch.no_grad()
     def initialize_projected(self, image_features, text_features, pids):
+        prototype_seed = getattr(self.args, "seed", None)
+        if prototype_seed is not None:
+            prototype_seed = int(prototype_seed) + 1000
         self.memory.initialize(
             image_features,
             text_features,
             pids,
             num_iters=getattr(self.args, "prototype_kmeans_iters", 20),
-            seed=getattr(self.args, "seed", 1),
+            seed=prototype_seed,
         )
 
     def _project(self, image_features, text_features):
