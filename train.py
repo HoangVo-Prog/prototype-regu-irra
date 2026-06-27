@@ -18,9 +18,25 @@ from utils.comm import get_rank, synchronize
 from utils.wandb_logger import init_wandb
 
 
+def _configure_attention_determinism(enabled):
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    if cuda_backends is None:
+        return
+
+    for name, value in (
+        ("enable_flash_sdp", not enabled),
+        ("enable_mem_efficient_sdp", not enabled),
+        ("enable_math_sdp", True),
+    ):
+        setter = getattr(cuda_backends, name, None)
+        if setter is not None:
+            setter(value)
+
+
 def set_seed(seed=0, deterministic=False):
     if deterministic:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        os.environ.setdefault("PYTHONHASHSEED", str(seed))
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -33,14 +49,16 @@ def set_seed(seed=0, deterministic=False):
             torch.backends.cuda.matmul.allow_tf32 = False
         if hasattr(torch.backends, "cudnn"):
             torch.backends.cudnn.allow_tf32 = False
+        _configure_attention_determinism(True)
         if hasattr(torch, "use_deterministic_algorithms"):
             try:
-                torch.use_deterministic_algorithms(True, warn_only=True)
+                torch.use_deterministic_algorithms(True, warn_only=False)
             except TypeError:
                 torch.use_deterministic_algorithms(True)
     else:
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
+        _configure_attention_determinism(False)
         if hasattr(torch, "use_deterministic_algorithms"):
             try:
                 torch.use_deterministic_algorithms(False, warn_only=True)
