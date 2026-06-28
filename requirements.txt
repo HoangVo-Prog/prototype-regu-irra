@@ -1,0 +1,16 @@
+torch
+scikit-learn
+scikit-image
+opencv-python
+
+tensorboard
+matplotlib
+
+tqdm
+easydict
+ftfy
+regex
+prettytable
+
+pyyaml
+wandb
