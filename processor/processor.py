@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from prettytable import PrettyTable
 from datasets.bases import ImageTextDataset
 from datasets.build import build_transforms, collate, make_data_loader_generator, seed_worker
+from utils.eval_schedule import should_evaluate_epoch
 
 
 def _unwrap_model(model):
@@ -207,6 +208,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     log_period = int(args.log_period)
     eval_period = int(args.eval_period)
+    eval_after_epoch = int(getattr(args, "eval_after_epoch", 0))
     device = "cuda"
     num_epoch = args.num_epoch
     arguments = {}
@@ -360,7 +362,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     "Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]"
                     .format(epoch, time_per_batch,
                             train_loader.batch_size / time_per_batch))
-            if epoch % eval_period == 0:
+            if should_evaluate_epoch(epoch, eval_period, eval_after_epoch):
                 if get_rank() == 0:
                     logger.info("Validation Results - Epoch: {}".format(epoch))
                     if args.distributed:
@@ -381,7 +383,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     if wandb_logger is not None:
                         wandb_logger.log(eval_metrics, step=arguments["iteration"])
         if get_rank() == 0:
-            logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
+            logger.info(f"best R1: {best_top1} at epoch {arguments.get('epoch', 0)}")
     finally:
         tb_writer.close()
 
