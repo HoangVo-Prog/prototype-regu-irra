@@ -18,6 +18,23 @@ from utils.comm import get_rank, synchronize
 from utils.wandb_logger import init_wandb
 
 
+<<<<<<< HEAD
+=======
+def _configure_attention_backends():
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    if cuda_backends is None:
+        return
+
+    # Keep fused SDPA backends available. Strict deterministic algorithms below
+    # control whether their backward kernels may use nondeterministic variants;
+    # forcing math-only SDPA makes the MLM branch run out of memory.
+    for name in ("enable_flash_sdp", "enable_mem_efficient_sdp", "enable_math_sdp"):
+        setter = getattr(cuda_backends, name, None)
+        if setter is not None:
+            setter(True)
+
+
+>>>>>>> b56a5abf4a809998c8ea41ab97ab4c98a5edb9bc
 def set_seed(seed=0, deterministic=False):
     if deterministic:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -33,6 +50,10 @@ def set_seed(seed=0, deterministic=False):
             torch.backends.cuda.matmul.allow_tf32 = False
         if hasattr(torch.backends, "cudnn"):
             torch.backends.cudnn.allow_tf32 = False
+<<<<<<< HEAD
+=======
+        _configure_attention_backends()
+>>>>>>> b56a5abf4a809998c8ea41ab97ab4c98a5edb9bc
         if hasattr(torch, "use_deterministic_algorithms"):
             try:
                 torch.use_deterministic_algorithms(True, warn_only=True)
@@ -41,6 +62,10 @@ def set_seed(seed=0, deterministic=False):
     else:
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
+<<<<<<< HEAD
+=======
+        _configure_attention_backends()
+>>>>>>> b56a5abf4a809998c8ea41ab97ab4c98a5edb9bc
         if hasattr(torch, "use_deterministic_algorithms"):
             try:
                 torch.use_deterministic_algorithms(False, warn_only=True)
