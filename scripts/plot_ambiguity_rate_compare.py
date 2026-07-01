@@ -204,6 +204,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for feature extraction.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers.")
     parser.add_argument("--device", default="cuda", help='Device, e.g. "cuda" or "cpu".')
+    parser.add_argument("--skip_test_eval", action="store_true", help="Skip the initial standard test-set retrieval verification.")
     parser.add_argument("--max_queries", type=int, default=None, help="Optional query limit for debugging.")
     parser.add_argument("--img_size", default="384,128", help='Input image size as "height,width".')
     parser.add_argument("--text_length", type=int, default=77, help="Tokenized text length.")
@@ -1431,36 +1432,42 @@ def main() -> None:
 
     device = resolve_device(args.device)
     model_args = build_model_args(args)
-    test_split_data = load_split_data(args.dataset_name, dataset_root, "test")
-    validate_split_data(test_split_data, "test")
+    if args.skip_test_eval:
+        print("[Verification] Skipping standard retrieval evaluation on test split because --skip_test_eval was set.")
+        baseline_eval_meta = {"skipped": True, "reason": "--skip_test_eval"}
+        ours_eval_meta = {"skipped": True, "reason": "--skip_test_eval"}
+        split_data = load_split_data(args.dataset_name, dataset_root, args.split)
+    else:
+        test_split_data = load_split_data(args.dataset_name, dataset_root, "test")
+        validate_split_data(test_split_data, "test")
 
-    print(
-        f"[Verification] Running standard retrieval evaluation on test split "
-        f"for {args.dataset_name}: queries={len(test_split_data.captions)} "
-        f"gallery={len(test_split_data.img_paths)}"
-    )
-    print(f"[Baseline] Verifying {baseline_checkpoint}")
-    baseline_eval_meta = evaluate_checkpoint_on_test_split(
-        "Baseline",
-        baseline_checkpoint,
-        model_args,
-        test_split_data,
-        device,
-        args.batch_size,
-        args.num_workers,
-    )
-    print(f"[Ours] Verifying {ours_checkpoint}")
-    ours_eval_meta = evaluate_checkpoint_on_test_split(
-        "Ours",
-        ours_checkpoint,
-        model_args,
-        test_split_data,
-        device,
-        args.batch_size,
-        args.num_workers,
-    )
+        print(
+            f"[Verification] Running standard retrieval evaluation on test split "
+            f"for {args.dataset_name}: queries={len(test_split_data.captions)} "
+            f"gallery={len(test_split_data.img_paths)}"
+        )
+        print(f"[Baseline] Verifying {baseline_checkpoint}")
+        baseline_eval_meta = evaluate_checkpoint_on_test_split(
+            "Baseline",
+            baseline_checkpoint,
+            model_args,
+            test_split_data,
+            device,
+            args.batch_size,
+            args.num_workers,
+        )
+        print(f"[Ours] Verifying {ours_checkpoint}")
+        ours_eval_meta = evaluate_checkpoint_on_test_split(
+            "Ours",
+            ours_checkpoint,
+            model_args,
+            test_split_data,
+            device,
+            args.batch_size,
+            args.num_workers,
+        )
 
-    split_data = test_split_data if args.split == "test" else load_split_data(args.dataset_name, dataset_root, args.split)
+        split_data = test_split_data if args.split == "test" else load_split_data(args.dataset_name, dataset_root, args.split)
     split_data = limit_queries(split_data, args.max_queries)
     validate_split_data(split_data, args.split)
 
@@ -1499,6 +1506,7 @@ def main() -> None:
     summary = {
         "dataset_name": args.dataset_name,
         "split": args.split,
+        "skip_test_eval": bool(args.skip_test_eval),
         "baseline_checkpoint": str(baseline_checkpoint),
         "ours_checkpoint": str(ours_checkpoint),
         "baseline_name": args.baseline_name,
