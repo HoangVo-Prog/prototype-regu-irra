@@ -200,7 +200,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline_name", default="Host", help="Legend/display name for the baseline checkpoint.")
     parser.add_argument("--ours_name", default="IAPR", help="Legend/display name for the ours checkpoint.")
     parser.add_argument("--output_dir", default="outputs/ambiguity_rate_compare", help="Directory to save outputs.")
-    parser.add_argument("--thresholds", default="0,0.01,0.02,0.05,0.10", help="Comma-separated margin thresholds.")
+    parser.add_argument(
+        "--margin_scale",
+        default="iqr",
+        choices=["none", "iqr", "std"],
+        help="Score-scale normalization for margins: none keeps raw margins; iqr/std divide by the score IQR/std.",
+    )
+    parser.add_argument("--scale_eta", type=float, default=1e-12, help="Small denominator added to the score scale.")
+    parser.add_argument("--threshold", type=float, default=0.01, help="Single raw epsilon or normalized rho threshold.")
+    parser.add_argument("--thresholds", default="", help="Comma-separated thresholds. If empty, --threshold is used.")
+    parser.add_argument(
+        "--scale_sample_size",
+        type=int,
+        default=2_000_000,
+        help="Maximum number of query-gallery scores sampled for IQR/std. Use 0 for exact all-score scaling.",
+    )
+    parser.add_argument("--save_threshold_csv", action="store_true", help="Also save threshold_sweep.csv.")
+    parser.add_argument("--seed", type=int, default=1, help="Deterministic seed for score-scale sampling.")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for feature extraction.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers.")
     parser.add_argument("--device", default="cuda", help='Device, e.g. "cuda" or "cpu".')
@@ -255,12 +271,199 @@ def parse_thresholds(value: str) -> List[float]:
     return thresholds
 
 
+def resolve_thresholds(args: argparse.Namespace) -> List[float]:
+    if str(getattr(args, "thresholds", "")).strip():
+        return parse_thresholds(args.thresholds)
+    threshold = float(args.threshold)
+    if not math.isfinite(threshold):
+        raise ValueError(f"--threshold must be finite, got {args.threshold!r}.")
+    return [threshold]
+
+
 def threshold_label(threshold: float) -> str:
     if abs(threshold) < 1e-12:
         return "0"
     if abs(threshold) < 1.0:
         return f"{threshold:.2f}"
     return f"{threshold:g}"
+
+
+def threshold_type_for_scale(margin_scale: str) -> str:
+    return "raw" if margin_scale == "none" else "normalized"
+
+
+def init_scale_sampling(
+    margin_scale: str,
+    num_queries: int,
+    num_gallery: int,
+    scale_sample_size: int,
+    seed: int,
+) -> Dict[str, Any]:
+    total = int(num_queries) * int(num_gallery)
+    if margin_scale == "none":
+        return {
+            "enabled": False,
+            "total": total,
+            "used": 0,
+            "exact": True,
+            "sample_indices": None,
+            "values": [],
+        }
+    if scale_sample_size < 0:
+        raise ValueError("--scale_sample_size must be non-negative.")
+    exact = scale_sample_size == 0 or total <= int(scale_sample_size)
+    used = total if exact else min(int(scale_sample_size), total)
+    sample_indices = None
+    if not exact and used > 0:
+        rng = np.random.default_rng(int(seed))
+        sample_indices = np.sort(rng.choice(total, size=used, replace=False).astype(np.int64))
+    return {
+        "enabled": True,
+        "total": total,
+        "used": used,
+        "exact": exact,
+        "sample_indices": sample_indices,
+        "values": [],
+    }
+
+
+def collect_scale_scores(state: MutableMapping[str, Any], sim_chunk: torch.Tensor, start: int, num_gallery: int) -> None:
+    if not state.get("enabled", False):
+        return
+    flat = sim_chunk.detach().cpu().reshape(-1).numpy()
+    if bool(state["exact"]):
+        state["values"].append(np.asarray(flat, dtype=np.float64).copy())
+        return
+
+    sample_indices = state.get("sample_indices")
+    if sample_indices is None or len(sample_indices) == 0:
+        return
+    lo = int(start) * int(num_gallery)
+    hi = lo + int(flat.shape[0])
+    left = int(np.searchsorted(sample_indices, lo, side="left"))
+    right = int(np.searchsorted(sample_indices, hi, side="left"))
+    if right <= left:
+        return
+    local = sample_indices[left:right] - lo
+    state["values"].append(np.asarray(flat[local], dtype=np.float64).copy())
+
+
+def finalize_scale_metadata(
+    state: Mapping[str, Any],
+    margin_scale: str,
+    scale_eta: float,
+    seed: int,
+) -> Dict[str, Any]:
+    if margin_scale == "none":
+        return {
+            "margin_scale": margin_scale,
+            "scale_value": 1.0,
+            "scale_eta": float(scale_eta),
+            "scale_score_count_total": int(state["total"]),
+            "scale_score_count_used": 0,
+            "scale_sampling_seed": int(seed),
+            "scale_is_exact": True,
+        }
+
+    values_list = list(state.get("values", []))
+    values = np.concatenate(values_list) if values_list else np.zeros((0,), dtype=np.float64)
+    if values.size == 0:
+        raise RuntimeError("No similarity scores were available for score-scale estimation.")
+    if margin_scale == "iqr":
+        q25, q75 = np.percentile(values, [25.0, 75.0])
+        scale_value = float(q75 - q25)
+    elif margin_scale == "std":
+        q25 = q75 = None
+        scale_value = float(np.std(values))
+    else:
+        raise ValueError(f"Unsupported margin_scale: {margin_scale!r}")
+    if not math.isfinite(scale_value):
+        raise RuntimeError(f"Estimated score scale is not finite: {scale_value!r}.")
+
+    metadata: Dict[str, Any] = {
+        "margin_scale": margin_scale,
+        "scale_value": scale_value,
+        "scale_eta": float(scale_eta),
+        "scale_score_count_total": int(state["total"]),
+        "scale_score_count_used": int(values.size),
+        "scale_sampling_seed": int(seed),
+        "scale_is_exact": bool(state["exact"]),
+    }
+    if margin_scale == "iqr":
+        metadata["scale_q25"] = float(q25)
+        metadata["scale_q75"] = float(q75)
+    return metadata
+
+
+def add_normalized_margins(rows: Sequence[MutableMapping[str, Any]], scale_value: float, scale_eta: float) -> None:
+    denom = float(scale_value) + float(scale_eta)
+    if denom == 0.0:
+        raise ValueError("Score-scale denominator is zero; increase --scale_eta.")
+    for row in rows:
+        row["margin_normalized"] = float(row["margin"]) / denom
+
+
+def compute_margin_rows_with_scale(
+    query_pids: torch.Tensor,
+    gallery_pids: torch.Tensor,
+    similarity_chunk_fn: Any,
+    margin_scale: str,
+    scale_eta: float,
+    scale_sample_size: int,
+    seed: int,
+    chunk_size: int = 512,
+) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+    query_pids = query_pids.cpu().long()
+    gallery_pids = gallery_pids.cpu().long()
+    num_queries = int(query_pids.numel())
+    num_gallery = int(gallery_pids.numel())
+    state = init_scale_sampling(margin_scale, num_queries, num_gallery, scale_sample_size, seed)
+    rows: List[Dict[str, Any]] = []
+    skipped = 0
+    chunk_size = max(1, int(chunk_size))
+
+    for start in tqdm(range(0, num_queries, chunk_size), desc="Computing margins and score scale"):
+        end = min(start + chunk_size, num_queries)
+        sim_chunk = similarity_chunk_fn(start, end).detach().cpu().float()
+        expected_shape = (end - start, num_gallery)
+        if tuple(sim_chunk.shape) != expected_shape:
+            raise RuntimeError(f"Similarity chunk shape {tuple(sim_chunk.shape)} does not match expected {expected_shape}.")
+        collect_scale_scores(state, sim_chunk, start, num_gallery)
+
+        for local_index in range(sim_chunk.shape[0]):
+            query_index = start + local_index
+            query_pid = int(query_pids[query_index].item())
+            scores = sim_chunk[local_index]
+            pos_mask = gallery_pids.eq(query_pid)
+            neg_mask = ~pos_mask
+
+            if not bool(pos_mask.any()) or not bool(neg_mask.any()):
+                skipped += 1
+                continue
+
+            pos_scores = scores.masked_fill(~pos_mask, float("-inf"))
+            neg_scores = scores.masked_fill(~neg_mask, float("-inf"))
+            best_pos_score, best_pos_index = torch.max(pos_scores, dim=0)
+            hard_neg_score, hard_neg_index = torch.max(neg_scores, dim=0)
+            margin = best_pos_score - hard_neg_score
+
+            rows.append(
+                {
+                    "query_index": int(query_index),
+                    "query_pid": query_pid,
+                    "best_pos_index": int(best_pos_index.item()),
+                    "best_pos_pid": int(gallery_pids[best_pos_index].item()),
+                    "best_pos_score": float(best_pos_score.item()),
+                    "hard_neg_index": int(hard_neg_index.item()),
+                    "hard_neg_pid": int(gallery_pids[hard_neg_index].item()),
+                    "hard_neg_score": float(hard_neg_score.item()),
+                    "margin": float(margin.item()),
+                }
+            )
+
+    scale_metadata = finalize_scale_metadata(state, margin_scale, scale_eta, seed)
+    add_normalized_margins(rows, float(scale_metadata["scale_value"]), 0.0 if margin_scale == "none" else scale_eta)
+    return rows, skipped, scale_metadata
 
 
 def default_model_args() -> Dict[str, Any]:
@@ -855,7 +1058,7 @@ def summarize_margins(rows: Sequence[Mapping[str, Any]], total_queries: int, ski
         raise RuntimeError("No usable queries remained after filtering queries without positives/negatives.")
 
     margins = np.array([float(row["margin"]) for row in rows], dtype=np.float64)
-    return {
+    summary = {
         "num_queries_total": int(total_queries),
         "num_queries_used": int(len(rows)),
         "num_queries_skipped": int(skipped),
@@ -868,6 +1071,18 @@ def summarize_margins(rows: Sequence[Mapping[str, Any]], total_queries: int, ski
         "percent_margin_below_0_01": float(np.mean(margins < 0.01) * 100.0),
         "percent_margin_below_0_05": float(np.mean(margins < 0.05) * 100.0),
     }
+    if "margin_normalized" in rows[0]:
+        norm = np.array([float(row["margin_normalized"]) for row in rows], dtype=np.float64)
+        summary.update(
+            {
+                "mean_margin_normalized": float(np.mean(norm)),
+                "median_margin_normalized": float(np.median(norm)),
+                "std_margin_normalized": float(np.std(norm)),
+                "min_margin_normalized": float(np.min(norm)),
+                "max_margin_normalized": float(np.max(norm)),
+            }
+        )
+    return summary
 
 
 def load_model_for_checkpoint(
@@ -899,6 +1114,10 @@ def compute_margins_for_checkpoint(
     device: torch.device,
     batch_size: int,
     num_workers: int,
+    margin_scale: str = "none",
+    scale_eta: float = 1e-12,
+    scale_sample_size: int = 2_000_000,
+    seed: int = 1,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     model: Optional[torch.nn.Module] = None
     text_features: Optional[torch.Tensor] = None
@@ -931,13 +1150,23 @@ def compute_margins_for_checkpoint(
             device=device,
         )
 
-        sim = text_features @ image_features.t()
-        rows, skipped = compute_margin_rows(sim, query_pids, gallery_pids)
+        image_features_t = image_features.t().float()
+        rows, skipped, scale_metadata = compute_margin_rows_with_scale(
+            query_pids,
+            gallery_pids,
+            lambda start, end: text_features[start:end].float() @ image_features_t,
+            margin_scale=margin_scale,
+            scale_eta=scale_eta,
+            scale_sample_size=scale_sample_size,
+            seed=seed,
+            chunk_size=batch_size,
+        )
         margin_summary = summarize_margins(rows, total_queries=len(query_pids), skipped=skipped)
         metadata: Dict[str, Any] = {
             "checkpoint": str(checkpoint),
             "load_stats": load_stats,
             "margin_summary": margin_summary,
+            "scale_metadata": scale_metadata,
         }
         return rows, metadata
     finally:
@@ -1116,6 +1345,7 @@ MARGIN_COLUMNS = [
     "hard_neg_pid",
     "hard_neg_score",
     "margin",
+    "margin_normalized",
 ]
 
 MERGED_COLUMNS = [
@@ -1124,6 +1354,9 @@ MERGED_COLUMNS = [
     "margin_baseline",
     "margin_ours",
     "delta_margin",
+    "margin_baseline_normalized",
+    "margin_ours_normalized",
+    "delta_margin_normalized",
     "baseline_best_pos_index",
     "baseline_best_pos_pid",
     "baseline_best_pos_score",
@@ -1140,6 +1373,19 @@ MERGED_COLUMNS = [
 
 AMBIGUITY_RATE_COLUMNS = [
     "threshold",
+    "threshold_type",
+    "num_queries_total",
+    "num_queries_usable",
+    "A_host",
+    "A_iapr",
+    "delta_A",
+    "esc",
+    "new",
+    "num_host_ambiguous",
+    "num_iapr_ambiguous",
+    "num_escaped",
+    "num_new",
+    "transition_consistency_error",
     "baseline_count",
     "ours_count",
     "baseline_percent",
@@ -1200,6 +1446,8 @@ def merge_margin_rows(
         ours = ours_map[key]
         baseline_margin = float(baseline["margin"])
         ours_margin = float(ours["margin"])
+        baseline_margin_norm = float(baseline.get("margin_normalized", baseline_margin))
+        ours_margin_norm = float(ours.get("margin_normalized", ours_margin))
         merged.append(
             {
                 "query_index": int(key[0]),
@@ -1207,6 +1455,9 @@ def merge_margin_rows(
                 "margin_baseline": baseline_margin,
                 "margin_ours": ours_margin,
                 "delta_margin": ours_margin - baseline_margin,
+                "margin_baseline_normalized": baseline_margin_norm,
+                "margin_ours_normalized": ours_margin_norm,
+                "delta_margin_normalized": ours_margin_norm - baseline_margin_norm,
                 "baseline_best_pos_index": int(baseline["best_pos_index"]),
                 "baseline_best_pos_pid": int(baseline["best_pos_pid"]),
                 "baseline_best_pos_score": float(baseline["best_pos_score"]),
@@ -1227,29 +1478,59 @@ def merge_margin_rows(
 def compute_ambiguity_rates(
     merged_rows: Sequence[Mapping[str, Any]],
     thresholds: Sequence[float],
+    margin_scale: str,
+    num_queries_total: int,
 ) -> List[Dict[str, Any]]:
     if not merged_rows:
         raise RuntimeError("No merged query rows are available for ambiguity-rate computation.")
 
-    baseline_margins = np.array([float(row["margin_baseline"]) for row in merged_rows], dtype=np.float64)
-    ours_margins = np.array([float(row["margin_ours"]) for row in merged_rows], dtype=np.float64)
+    if margin_scale == "none":
+        baseline_margins = np.array([float(row["margin_baseline"]) for row in merged_rows], dtype=np.float64)
+        ours_margins = np.array([float(row["margin_ours"]) for row in merged_rows], dtype=np.float64)
+    else:
+        baseline_margins = np.array([float(row["margin_baseline_normalized"]) for row in merged_rows], dtype=np.float64)
+        ours_margins = np.array([float(row["margin_ours_normalized"]) for row in merged_rows], dtype=np.float64)
     num_queries = int(len(merged_rows))
+    threshold_type = threshold_type_for_scale(margin_scale)
     rows: List[Dict[str, Any]] = []
 
     for threshold in thresholds:
-        baseline_count = int(np.sum(baseline_margins < threshold))
-        ours_count = int(np.sum(ours_margins < threshold))
+        baseline_ambiguous = baseline_margins < threshold
+        ours_ambiguous = ours_margins < threshold
+        escaped_mask = baseline_ambiguous & ~ours_ambiguous
+        new_mask = ~baseline_ambiguous & ours_ambiguous
+        baseline_count = int(np.sum(baseline_ambiguous))
+        ours_count = int(np.sum(ours_ambiguous))
+        escaped_count = int(np.sum(escaped_mask))
+        new_count = int(np.sum(new_mask))
         baseline_percent = float(baseline_count / num_queries * 100.0)
         ours_percent = float(ours_count / num_queries * 100.0)
+        delta_a = float(baseline_percent - ours_percent)
         delta_percent_point = float(ours_percent - baseline_percent)
+        esc = float(escaped_count / num_queries * 100.0)
+        new = float(new_count / num_queries * 100.0)
         if baseline_percent > 0.0:
             relative_reduction_percent = float((baseline_percent - ours_percent) / baseline_percent * 100.0)
         else:
             relative_reduction_percent = 0.0
+        transition_consistency_error = float(delta_a - (esc - new))
 
         rows.append(
             {
                 "threshold": float(threshold),
+                "threshold_type": threshold_type,
+                "num_queries_total": int(num_queries_total),
+                "num_queries_usable": num_queries,
+                "A_host": baseline_percent,
+                "A_iapr": ours_percent,
+                "delta_A": delta_a,
+                "esc": esc,
+                "new": new,
+                "num_host_ambiguous": baseline_count,
+                "num_iapr_ambiguous": ours_count,
+                "num_escaped": escaped_count,
+                "num_new": new_count,
+                "transition_consistency_error": transition_consistency_error,
                 "baseline_count": baseline_count,
                 "ours_count": ours_count,
                 "baseline_percent": baseline_percent,
@@ -1284,6 +1565,7 @@ def plot_ambiguity_rates(
     baseline_name: str,
     ours_name: str,
     plot_type: str,
+    margin_scale: str,
     dpi: int,
     pdf_path: Path,
     png_path: Path,
@@ -1299,11 +1581,21 @@ def plot_ambiguity_rates(
     labels = [threshold_label(float(row["threshold"])) for row in ambiguity_rates]
     baseline_values = np.array([float(row["baseline_percent"]) for row in ambiguity_rates], dtype=np.float64)
     ours_values = np.array([float(row["ours_percent"]) for row in ambiguity_rates], dtype=np.float64)
+    delta_values = np.array([float(row["delta_A"]) for row in ambiguity_rates], dtype=np.float64)
+    use_delta_curve = plot_type == "curve" and len(ambiguity_rates) > 1
 
     fig, ax = plt.subplots(figsize=(3.4, 2.2))
     colors = ("#4C78A8", "#F58518")
 
-    if plot_type == "bar":
+    if use_delta_curve:
+        x = np.array([float(row["threshold"]) for row in ambiguity_rates], dtype=np.float64)
+        ax.plot(x, delta_values, marker="o", linewidth=1.4, markersize=3.5, color="#4C78A8")
+        ax.axhline(0.0, color="#777777", linestyle=":", linewidth=0.9)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ymax = float(max(np.max(np.abs(delta_values)), 1.0))
+        ax.set_ylim(float(np.min(delta_values)) - 0.12 * ymax - 0.2, float(np.max(delta_values)) + 0.12 * ymax + 0.2)
+    elif plot_type == "bar":
         x = np.arange(len(labels))
         width = 0.36
         baseline_bars = ax.bar(x - width / 2, baseline_values, width, label=baseline_name, color=colors[0])
@@ -1335,10 +1627,14 @@ def plot_ambiguity_rates(
     else:
         raise ValueError(f"Unsupported plot_type: {plot_type!r}")
 
-    ax.set_xlabel("Margin threshold ε")
-    ax.set_ylabel("Ambiguous queries (%)")
+    if margin_scale == "none":
+        ax.set_xlabel("Raw margin threshold epsilon")
+    else:
+        ax.set_xlabel(r"Normalized threshold $\rho$")
+    ax.set_ylabel(r"$\Delta A(\rho)$ (pp)" if use_delta_curve else r"$A(\rho)$ (%)")
     ax.grid(True, axis="y", alpha=0.25, linewidth=0.6)
-    ax.legend(frameon=False, fontsize=8)
+    if not use_delta_curve:
+        ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(pdf_path, bbox_inches="tight")
     fig.savefig(png_path, dpi=dpi, bbox_inches="tight")
@@ -1364,6 +1660,7 @@ def print_terminal_summary(
     ours_summary: Mapping[str, Any],
     ambiguity_rates: Sequence[Mapping[str, Any]],
     delta_summary: Mapping[str, Any],
+    margin_scale: str,
     paths: Mapping[str, Path],
 ) -> None:
     print(
@@ -1385,15 +1682,17 @@ def print_terminal_summary(
         f"<0.05={ours_summary['percent_margin_below_0_05']:.2f}%"
     )
 
-    print("\nAmbiguity rate:")
-    print("threshold | baseline % | ours % | delta pp | relative reduction %")
+    print("\nAmbiguity threshold sweep:")
+    threshold_name = "epsilon" if margin_scale == "none" else "rho"
+    print(f"{threshold_name:<8} | A_host | A_iapr | DeltaA | Esc | New")
     for row in ambiguity_rates:
         print(
             f"{threshold_label(float(row['threshold'])):<9} | "
-            f"{row['baseline_percent']:10.2f} | "
-            f"{row['ours_percent']:6.2f} | "
-            f"{row['delta_percent_point']:8.2f} | "
-            f"{row['relative_reduction_percent']:20.2f}"
+            f"{row['A_host']:6.2f} | "
+            f"{row['A_iapr']:6.2f} | "
+            f"{row['delta_A']:6.2f} | "
+            f"{row['esc']:5.2f} | "
+            f"{row['new']:5.2f}"
         )
 
     print("\nPaired delta:")
@@ -1418,8 +1717,12 @@ def main() -> None:
         raise ValueError("--text_length must be positive.")
     if args.dpi <= 0:
         raise ValueError("--dpi must be positive.")
+    if not math.isfinite(args.scale_eta) or args.scale_eta < 0.0:
+        raise ValueError("--scale_eta must be a finite non-negative value.")
+    if args.scale_sample_size < 0:
+        raise ValueError("--scale_sample_size must be non-negative.")
 
-    thresholds = parse_thresholds(args.thresholds)
+    thresholds = resolve_thresholds(args)
     dataset_root = resolve_path(args.dataset_root)
     baseline_checkpoint = resolve_path(args.baseline_checkpoint)
     ours_checkpoint = resolve_path(args.ours_checkpoint)
@@ -1483,6 +1786,10 @@ def main() -> None:
         device,
         args.batch_size,
         args.num_workers,
+        margin_scale=args.margin_scale,
+        scale_eta=args.scale_eta,
+        scale_sample_size=args.scale_sample_size,
+        seed=args.seed,
     )
     print_load_stats("Baseline", baseline_meta)
 
@@ -1494,11 +1801,20 @@ def main() -> None:
         device,
         args.batch_size,
         args.num_workers,
+        margin_scale=args.margin_scale,
+        scale_eta=args.scale_eta,
+        scale_sample_size=args.scale_sample_size,
+        seed=args.seed,
     )
     print_load_stats("Ours", ours_meta)
 
     merged_rows = merge_margin_rows(baseline_rows, ours_rows)
-    ambiguity_rates = compute_ambiguity_rates(merged_rows, thresholds)
+    ambiguity_rates = compute_ambiguity_rates(
+        merged_rows,
+        thresholds,
+        margin_scale=args.margin_scale,
+        num_queries_total=len(split_data.captions),
+    )
     delta_summary = paired_delta_summary(merged_rows)
     baseline_summary = baseline_meta["margin_summary"]
     ours_summary = ours_meta["margin_summary"]
@@ -1514,12 +1830,19 @@ def main() -> None:
         "num_queries_total": int(len(split_data.captions)),
         "num_queries_used": int(len(merged_rows)),
         "thresholds": [float(threshold) for threshold in thresholds],
+        "threshold_type": threshold_type_for_scale(args.margin_scale),
+        "margin_scale": args.margin_scale,
+        "scale_eta": float(args.scale_eta),
+        "scale_sample_size": int(args.scale_sample_size),
+        "threshold_sweep": ambiguity_rates,
         "baseline_margin_summary": baseline_summary,
         "ours_margin_summary": ours_summary,
         "ambiguity_rates": ambiguity_rates,
         "paired_delta_summary": delta_summary,
         "baseline_load_stats": baseline_meta.get("load_stats", {}),
         "ours_load_stats": ours_meta.get("load_stats", {}),
+        "baseline_scale_metadata": baseline_meta.get("scale_metadata", {}),
+        "ours_scale_metadata": ours_meta.get("scale_metadata", {}),
         "test_retrieval_verification": {
             "baseline": baseline_eval_meta,
             "ours": ours_eval_meta,
@@ -1536,17 +1859,22 @@ def main() -> None:
         "fig_ambiguity_rate_compare.png": output_dir / "fig_ambiguity_rate_compare.png",
         "latex_include_figure.txt": output_dir / "latex_include_figure.txt",
     }
+    if args.save_threshold_csv:
+        paths["threshold_sweep.csv"] = output_dir / "threshold_sweep.csv"
 
     save_csv(baseline_rows, paths["baseline_margins.csv"], MARGIN_COLUMNS)
     save_csv(ours_rows, paths["ours_margins.csv"], MARGIN_COLUMNS)
     save_csv(merged_rows, paths["merged_margins.csv"], MERGED_COLUMNS)
     save_csv(ambiguity_rates, paths["ambiguity_rates.csv"], AMBIGUITY_RATE_COLUMNS)
+    if args.save_threshold_csv:
+        save_csv(ambiguity_rates, paths["threshold_sweep.csv"], AMBIGUITY_RATE_COLUMNS)
     save_json(summary, paths["summary.json"])
     plot_ambiguity_rates(
         ambiguity_rates,
         baseline_name=args.baseline_name,
         ours_name=args.ours_name,
         plot_type=args.plot_type,
+        margin_scale=args.margin_scale,
         dpi=args.dpi,
         pdf_path=paths["fig_ambiguity_rate_compare.pdf"],
         png_path=paths["fig_ambiguity_rate_compare.png"],
@@ -1561,6 +1889,7 @@ def main() -> None:
         ours_summary,
         ambiguity_rates,
         delta_summary,
+        args.margin_scale,
         paths,
     )
 
