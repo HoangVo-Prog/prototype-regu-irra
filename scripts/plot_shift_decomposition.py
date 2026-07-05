@@ -663,6 +663,27 @@ def selected_plot_rows(rows: Sequence[Mapping[str, Any]], max_points: int, seed:
     return [selected[int(index)] for index in indices]
 
 
+def compute_shift_mechanism_stats(x: np.ndarray, y: np.ndarray, delta_m: np.ndarray) -> Dict[str, Dict[str, Any]]:
+    total = int(delta_m.size)
+    specs = [
+        ("ideal", "Ideal", (x < 0.0) & (y > 0.0) & (delta_m > 0.0)),
+        ("neg_supp_dom", "Neg-supp dom.", (x < 0.0) & (y < 0.0) & (delta_m > 0.0)),
+        ("pos_amp_dom", "Pos-amp dom.", (x > 0.0) & (y > 0.0) & (delta_m > 0.0)),
+        ("conf_amplified", "Conf. amplified", (x > 0.0) & (y < 0.0) & (delta_m < 0.0)),
+        ("hn_amp_dom", "HN amp. dom.", (x > 0.0) & (y > 0.0) & (delta_m < 0.0)),
+        ("pos_supp_dom", "Pos. supp. dom.", (x < 0.0) & (y < 0.0) & (delta_m < 0.0)),
+    ]
+    stats: Dict[str, Dict[str, Any]] = {}
+    for key, label, mask in specs:
+        count = int(np.sum(mask))
+        stats[key] = {
+            "label": label,
+            "count": count,
+            "percent": None if total == 0 else float(count / total * 100.0),
+        }
+    return stats
+
+
 def plot_shift_decomposition(
     rows: Sequence[Mapping[str, Any]],
     selected_stats: Mapping[str, Optional[float]],
@@ -686,8 +707,10 @@ def plot_shift_decomposition(
     x = np.array([float(row[x_key]) for row in plot_rows], dtype=np.float64)
     y = np.array([float(row[y_key]) for row in plot_rows], dtype=np.float64)
     improved = np.array([bool(row["margin_improved"]) for row in plot_rows], dtype=bool)
+    annotation_stats = stats_for_rows(plot_rows)
+    mechanism_stats = compute_shift_mechanism_stats(x, y, y - x)
 
-    selected_count = int(sum(bool(row["selected_by_threshold"]) for row in rows))
+    selected_count = int(len(plot_rows))
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height))
     if len(plot_rows):
         ax.scatter(
@@ -736,6 +759,19 @@ def plot_shift_decomposition(
     title = args.plot_title.strip() or f"{dataset_name} {split} shift decomposition"
     ax.set_title(title)
     ax.grid(True, alpha=0.22, linewidth=0.6)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "png": output_dir / "shift_decomposition.png",
+        "png_clean": output_dir / "shift_decomposition_clean.png",
+    }
+    fig.tight_layout()
+    fig.savefig(paths["png_clean"], dpi=args.dpi, bbox_inches="tight")
+    if args.plot_format == "pdf":
+        paths["pdf"] = output_dir / "shift_decomposition.pdf"
+        paths["pdf_clean"] = output_dir / "shift_decomposition_clean.pdf"
+        fig.savefig(paths["pdf_clean"], bbox_inches="tight")
+
     ax.legend(frameon=False, fontsize=8, loc="best")
 
     threshold_line = (r"$\rho$ = " if normalized else "threshold = ") + f"{args.threshold:g}"
@@ -744,14 +780,18 @@ def plot_shift_decomposition(
         f"N = {selected_count}",
         threshold_line,
         f"scale = {scale_label}" if normalized else "scale = raw",
-        r"% $\Delta m > 0$ = " + format_stat(selected_stats["pct_delta_m_positive"], "%"),
-        r"% $\Delta s^+ > 0$ = " + format_stat(selected_stats["pct_delta_s_pos_positive"], "%"),
-        r"% $\Delta s^- < 0$ = " + format_stat(selected_stats["pct_delta_s_neg_negative"], "%"),
-        "% both = " + format_stat(selected_stats["pct_attract_and_suppress"], "%"),
-        (r"median $\Delta m/c_H$ = " + format_stat(selected_stats["median_delta_m_norm"]))
+        r"% $\Delta m > 0$ = " + format_stat(annotation_stats["pct_delta_m_positive"], "%"),
+        r"% $\Delta s^+ > 0$ = " + format_stat(annotation_stats["pct_delta_s_pos_positive"], "%"),
+        r"% $\Delta s^- < 0$ = " + format_stat(annotation_stats["pct_delta_s_neg_negative"], "%"),
+        "% both = " + format_stat(annotation_stats["pct_attract_and_suppress"], "%"),
+        (r"median $\Delta m/c_H$ = " + format_stat(annotation_stats["median_delta_m_norm"]))
         if normalized
-        else (r"median $\Delta m$ = " + format_stat(selected_stats["median_delta_m"])),
+        else (r"median $\Delta m$ = " + format_stat(annotation_stats["median_delta_m"])),
     ]
+    box_lines.extend(
+        f"{values['label']}: {format_stat(values['percent'], '%')}"
+        for values in mechanism_stats.values()
+    )
     ax.text(
         0.03,
         0.97,
@@ -763,12 +803,9 @@ def plot_shift_decomposition(
         bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#CCCCCC", "alpha": 0.92},
     )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    paths = {"png": output_dir / "shift_decomposition.png"}
     fig.tight_layout()
     fig.savefig(paths["png"], dpi=args.dpi, bbox_inches="tight")
     if args.plot_format == "pdf":
-        paths["pdf"] = output_dir / "shift_decomposition.pdf"
         fig.savefig(paths["pdf"], bbox_inches="tight")
     plt.close(fig)
     return paths
@@ -821,6 +858,7 @@ def save_json(data: Mapping[str, Any], path: Path) -> None:
 def print_shift_summary(rows: Sequence[Mapping[str, Any]], selected_rows: Sequence[Mapping[str, Any]], stats: Mapping[str, Any]) -> None:
     print(
         f"[Shift] usable_queries={len(rows)} selected_queries={len(selected_rows)} "
+        f"plotted_queries={stats.get('num_queries_plotted', len(selected_rows))} "
         f"threshold={stats['threshold']} rule={stats['selection_rule']}"
     )
     if not selected_rows:
@@ -836,6 +874,10 @@ def print_shift_summary(rows: Sequence[Mapping[str, Any]], selected_rows: Sequen
         f"median_delta_m={format_stat(selected['median_delta_m'])}, "
         f"median_delta_m_norm={format_stat(selected['median_delta_m_norm'])}"
     )
+    mechanisms = stats.get("plot_mechanism_stats", {})
+    if mechanisms:
+        parts = [f"{values['label']}={format_stat(values['percent'], '%')}" for values in mechanisms.values()]
+        print("[Shift] Plotted mechanisms: " + ", ".join(parts))
 
 
 def main() -> None:
@@ -950,6 +992,13 @@ def main() -> None:
     selected_rows = [row for row in rows if bool(row["selected_by_threshold"])]
     full_stats = stats_for_rows(rows)
     selected_stats = stats_for_rows(selected_rows)
+    plot_rows = selected_plot_rows(rows, args.max_points, args.seed)
+    plot_x_key = "delta_s_neg_norm" if args.margin_scale != "none" else "delta_s_neg"
+    plot_y_key = "delta_s_pos_norm" if args.margin_scale != "none" else "delta_s_pos"
+    plot_x = np.array([float(row[plot_x_key]) for row in plot_rows], dtype=np.float64)
+    plot_y = np.array([float(row[plot_y_key]) for row in plot_rows], dtype=np.float64)
+    plot_stats = stats_for_rows(plot_rows)
+    plot_mechanism_stats = compute_shift_mechanism_stats(plot_x, plot_y, plot_y - plot_x)
 
     stats: Dict[str, Any] = {
         "dataset_name": args.dataset_name,
@@ -960,6 +1009,7 @@ def main() -> None:
         "num_queries_usable": int(len(rows)),
         "num_queries_skipped": int(skipped),
         "num_queries_selected": int(len(selected_rows)),
+        "num_queries_plotted": int(len(plot_rows)),
         "margin_scale": args.margin_scale,
         "scale_eta": float(args.scale_eta),
         "scale_sample_size": int(args.scale_sample_size),
@@ -971,6 +1021,8 @@ def main() -> None:
         "pair_selection": "host_fixed",
         "full": full_stats,
         "selected": selected_stats,
+        "plotted": plot_stats,
+        "plot_mechanism_stats": plot_mechanism_stats,
         "baseline_load_stats": baseline_meta.get("load_stats", {}),
         "iapr_load_stats": iapr_meta.get("load_stats", {}),
         "baseline_inference": baseline_meta.get("inference", {}),
