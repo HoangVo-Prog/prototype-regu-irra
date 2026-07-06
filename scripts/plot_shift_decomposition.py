@@ -88,6 +88,33 @@ INT_COLUMNS = {
     "neg_gallery_pid",
 }
 
+DEFAULT_LAYER_COLORS = {
+    "x_neg_y_pos": "#009E73",
+    "x_neg_y_neg_dm_pos": "#0072B2",
+    "x_pos_y_pos_dm_pos": "#56B4E9",
+    "x_pos_y_neg": "#D55E00",
+    "x_pos_y_pos_dm_neg": "#CC79A7",
+    "x_neg_y_neg_dm_neg": "#E69F00",
+}
+
+DEFAULT_LAYER_ALPHA = {
+    "x_neg_y_pos": 0.22,
+    "x_neg_y_neg_dm_pos": 0.13,
+    "x_pos_y_pos_dm_pos": 0.24,
+    "x_pos_y_neg": 0.24,
+    "x_pos_y_pos_dm_neg": 0.24,
+    "x_neg_y_neg_dm_neg": 0.13,
+}
+
+MECHANISM_LAYER_KEYS = {
+    "ideal": "x_neg_y_pos",
+    "neg_supp_dom": "x_neg_y_neg_dm_pos",
+    "pos_amp_dom": "x_pos_y_pos_dm_pos",
+    "conf_amplified": "x_pos_y_neg",
+    "hn_amp_dom": "x_pos_y_pos_dm_neg",
+    "pos_supp_dom": "x_neg_y_neg_dm_neg",
+}
+
 
 @dataclass
 class FeatureBundle:
@@ -136,25 +163,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fig_height", type=float, default=5.0)
     parser.add_argument("--alpha", type=float, default=None, help="Legacy alias for --point_alpha.")
     parser.add_argument("--marker_size", type=float, default=None, help="Legacy alias for --point_size.")
-    parser.add_argument("--point_alpha", type=float, default=0.24)
-    parser.add_argument("--point_size", type=float, default=10.0)
+    parser.add_argument("--point_alpha", type=float, default=None, help="Optional global alpha override for all mechanism layers.")
+    parser.add_argument("--point_size", type=float, default=7.0)
+    parser.add_argument("--point_edgecolors", default="none")
     parser.add_argument("--point_rasterized", dest="point_rasterized", action="store_true")
     parser.add_argument("--no_point_rasterized", dest="point_rasterized", action="store_false")
     parser.add_argument("--shuffle_points", dest="shuffle_points", action="store_true")
     parser.add_argument("--no_shuffle_points", dest="shuffle_points", action="store_false")
     parser.set_defaults(point_rasterized=True, shuffle_points=True)
-    parser.add_argument("--color_ideal", default="#2E8B57")
-    parser.add_argument("--color_neg_supp_dom", default="#4C78A8")
-    parser.add_argument("--color_pos_amp_dom", default="#72B7B2")
-    parser.add_argument("--color_conf_amplified", default="#D62728")
-    parser.add_argument("--color_hn_amp_dom", default="#B07AA1")
-    parser.add_argument("--color_pos_supp_dom", default="#9C755F")
-    parser.add_argument("--line_zero_color", default="#666666")
+    parser.add_argument("--color_ideal", default=DEFAULT_LAYER_COLORS[MECHANISM_LAYER_KEYS["ideal"]])
+    parser.add_argument("--color_neg_supp_dom", default=DEFAULT_LAYER_COLORS[MECHANISM_LAYER_KEYS["neg_supp_dom"]])
+    parser.add_argument("--color_pos_amp_dom", default=DEFAULT_LAYER_COLORS[MECHANISM_LAYER_KEYS["pos_amp_dom"]])
+    parser.add_argument("--color_conf_amplified", default=DEFAULT_LAYER_COLORS[MECHANISM_LAYER_KEYS["conf_amplified"]])
+    parser.add_argument("--color_hn_amp_dom", default=DEFAULT_LAYER_COLORS[MECHANISM_LAYER_KEYS["hn_amp_dom"]])
+    parser.add_argument("--color_pos_supp_dom", default=DEFAULT_LAYER_COLORS[MECHANISM_LAYER_KEYS["pos_supp_dom"]])
+    parser.add_argument("--alpha_ideal", type=float, default=DEFAULT_LAYER_ALPHA[MECHANISM_LAYER_KEYS["ideal"]])
+    parser.add_argument("--alpha_neg_supp_dom", type=float, default=DEFAULT_LAYER_ALPHA[MECHANISM_LAYER_KEYS["neg_supp_dom"]])
+    parser.add_argument("--alpha_pos_amp_dom", type=float, default=DEFAULT_LAYER_ALPHA[MECHANISM_LAYER_KEYS["pos_amp_dom"]])
+    parser.add_argument("--alpha_conf_amplified", type=float, default=DEFAULT_LAYER_ALPHA[MECHANISM_LAYER_KEYS["conf_amplified"]])
+    parser.add_argument("--alpha_hn_amp_dom", type=float, default=DEFAULT_LAYER_ALPHA[MECHANISM_LAYER_KEYS["hn_amp_dom"]])
+    parser.add_argument("--alpha_pos_supp_dom", type=float, default=DEFAULT_LAYER_ALPHA[MECHANISM_LAYER_KEYS["pos_supp_dom"]])
+    parser.add_argument("--line_zero_color", default="#6E6E6E")
     parser.add_argument("--line_zero_style", default=":")
-    parser.add_argument("--line_zero_width", type=float, default=1.1)
-    parser.add_argument("--line_diag_color", default="#333333")
+    parser.add_argument("--line_zero_width", type=float, default=1.2)
+    parser.add_argument("--line_diag_color", default="#2F2F2F")
     parser.add_argument("--line_diag_style", default="--")
-    parser.add_argument("--line_diag_width", type=float, default=1.5)
+    parser.add_argument("--line_diag_width", type=float, default=1.8)
     parser.add_argument("--max_points", type=int, default=0)
     parser.add_argument("--plot_title", default="")
     parser.add_argument("--save_csv", action="store_true")
@@ -194,8 +228,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--dpi must be positive.")
     if args.fig_width <= 0 or args.fig_height <= 0:
         raise ValueError("--fig_width and --fig_height must be positive.")
-    if not (0.0 < plot_point_alpha(args) <= 1.0):
+    global_alpha = plot_point_alpha(args)
+    if global_alpha is not None and not (0.0 < global_alpha <= 1.0):
         raise ValueError("--point_alpha/--alpha must be in (0, 1].")
+    for label, alpha in mechanism_alphas(args).items():
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError(f"Mechanism alpha for {label} must be in (0, 1].")
     if plot_point_size(args) <= 0:
         raise ValueError("--point_size/--marker_size must be positive.")
     if args.line_zero_width <= 0 or args.line_diag_width <= 0:
@@ -709,8 +747,12 @@ MECHANISM_LEGEND_LABELS = {
 }
 
 
-def plot_point_alpha(args: argparse.Namespace) -> float:
-    return float(args.alpha) if args.alpha is not None else float(args.point_alpha)
+def plot_point_alpha(args: argparse.Namespace) -> Optional[float]:
+    if args.alpha is not None:
+        return float(args.alpha)
+    if args.point_alpha is not None:
+        return float(args.point_alpha)
+    return None
 
 
 def plot_point_size(args: argparse.Namespace) -> float:
@@ -725,6 +767,20 @@ def mechanism_colors(args: argparse.Namespace) -> Dict[str, str]:
         "conf_amplified": str(args.color_conf_amplified),
         "hn_amp_dom": str(args.color_hn_amp_dom),
         "pos_supp_dom": str(args.color_pos_supp_dom),
+    }
+
+
+def mechanism_alphas(args: argparse.Namespace) -> Dict[str, float]:
+    global_alpha = plot_point_alpha(args)
+    if global_alpha is not None:
+        return {key: float(global_alpha) for key in MECHANISM_ORDER}
+    return {
+        "ideal": float(args.alpha_ideal),
+        "neg_supp_dom": float(args.alpha_neg_supp_dom),
+        "pos_amp_dom": float(args.alpha_pos_amp_dom),
+        "conf_amplified": float(args.alpha_conf_amplified),
+        "hn_amp_dom": float(args.alpha_hn_amp_dom),
+        "pos_supp_dom": float(args.alpha_pos_supp_dom),
     }
 
 
@@ -790,8 +846,9 @@ def plot_shift_decomposition(
     annotation_stats = stats_for_rows(plot_rows)
     mechanism_stats = compute_shift_mechanism_stats(x, y, delta_m_plot)
     colors = mechanism_colors(args)
-    point_alpha = plot_point_alpha(args)
+    alphas = mechanism_alphas(args)
     point_size = plot_point_size(args)
+    edgecolors = str(args.point_edgecolors)
     rng = np.random.default_rng(args.seed)
 
     selected_count = int(len(plot_rows))
@@ -808,8 +865,8 @@ def plot_shift_decomposition(
                 y[indices],
                 s=point_size,
                 c=colors[key],
-                alpha=point_alpha,
-                edgecolors="none",
+                alpha=alphas[key],
+                edgecolors=edgecolors,
                 linewidths=0,
                 rasterized=bool(args.point_rasterized),
                 label=MECHANISM_LEGEND_LABELS[key],
@@ -824,8 +881,8 @@ def plot_shift_decomposition(
                 y[other],
                 s=point_size,
                 c="#BDBDBD",
-                alpha=min(point_alpha, 0.18),
-                edgecolors="none",
+                alpha=min(min(alphas.values()), 0.18),
+                edgecolors=edgecolors,
                 linewidths=0,
                 rasterized=bool(args.point_rasterized),
                 label="_nolegend_",
