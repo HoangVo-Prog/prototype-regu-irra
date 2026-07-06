@@ -134,8 +134,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--fig_width", type=float, default=5.0)
     parser.add_argument("--fig_height", type=float, default=5.0)
-    parser.add_argument("--alpha", type=float, default=0.35)
-    parser.add_argument("--marker_size", type=float, default=10.0)
+    parser.add_argument("--alpha", type=float, default=None, help="Legacy alias for --point_alpha.")
+    parser.add_argument("--marker_size", type=float, default=None, help="Legacy alias for --point_size.")
+    parser.add_argument("--point_alpha", type=float, default=0.24)
+    parser.add_argument("--point_size", type=float, default=10.0)
+    parser.add_argument("--point_rasterized", dest="point_rasterized", action="store_true")
+    parser.add_argument("--no_point_rasterized", dest="point_rasterized", action="store_false")
+    parser.add_argument("--shuffle_points", dest="shuffle_points", action="store_true")
+    parser.add_argument("--no_shuffle_points", dest="shuffle_points", action="store_false")
+    parser.set_defaults(point_rasterized=True, shuffle_points=True)
+    parser.add_argument("--color_ideal", default="#2E8B57")
+    parser.add_argument("--color_neg_supp_dom", default="#4C78A8")
+    parser.add_argument("--color_pos_amp_dom", default="#72B7B2")
+    parser.add_argument("--color_conf_amplified", default="#D62728")
+    parser.add_argument("--color_hn_amp_dom", default="#B07AA1")
+    parser.add_argument("--color_pos_supp_dom", default="#9C755F")
+    parser.add_argument("--line_zero_color", default="#666666")
+    parser.add_argument("--line_zero_style", default=":")
+    parser.add_argument("--line_zero_width", type=float, default=1.1)
+    parser.add_argument("--line_diag_color", default="#333333")
+    parser.add_argument("--line_diag_style", default="--")
+    parser.add_argument("--line_diag_width", type=float, default=1.5)
     parser.add_argument("--max_points", type=int, default=0)
     parser.add_argument("--plot_title", default="")
     parser.add_argument("--save_csv", action="store_true")
@@ -175,10 +194,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--dpi must be positive.")
     if args.fig_width <= 0 or args.fig_height <= 0:
         raise ValueError("--fig_width and --fig_height must be positive.")
-    if not (0.0 < args.alpha <= 1.0):
-        raise ValueError("--alpha must be in (0, 1].")
-    if args.marker_size <= 0:
-        raise ValueError("--marker_size must be positive.")
+    if not (0.0 < plot_point_alpha(args) <= 1.0):
+        raise ValueError("--point_alpha/--alpha must be in (0, 1].")
+    if plot_point_size(args) <= 0:
+        raise ValueError("--point_size/--marker_size must be positive.")
+    if args.line_zero_width <= 0 or args.line_diag_width <= 0:
+        raise ValueError("--line_zero_width and --line_diag_width must be positive.")
     if args.max_points < 0:
         raise ValueError("--max_points must be non-negative.")
     if not math.isfinite(args.threshold):
@@ -654,6 +675,59 @@ def format_stat(value: Optional[float], suffix: str = "") -> str:
     return f"{value:.2f}{suffix}"
 
 
+MECHANISM_ORDER = [
+    "ideal",
+    "neg_supp_dom",
+    "pos_amp_dom",
+    "conf_amplified",
+    "hn_amp_dom",
+    "pos_supp_dom",
+]
+MECHANISM_DRAW_ORDER = [
+    "pos_supp_dom",
+    "hn_amp_dom",
+    "conf_amplified",
+    "neg_supp_dom",
+    "pos_amp_dom",
+    "ideal",
+]
+MECHANISM_LABELS = {
+    "ideal": "Ideal",
+    "neg_supp_dom": "Neg-supp dom.",
+    "pos_amp_dom": "Pos-amp dom.",
+    "conf_amplified": "Conf. amplified",
+    "hn_amp_dom": "HN amp. dom.",
+    "pos_supp_dom": "Pos. supp. dom.",
+}
+MECHANISM_LEGEND_LABELS = {
+    "ideal": "Ideal corr.",
+    "neg_supp_dom": "Neg-supp dom.",
+    "pos_amp_dom": "Pos-amp dom.",
+    "conf_amplified": "Conf. amplified",
+    "hn_amp_dom": "HN amp. dom.",
+    "pos_supp_dom": "Pos-supp dom.",
+}
+
+
+def plot_point_alpha(args: argparse.Namespace) -> float:
+    return float(args.alpha) if args.alpha is not None else float(args.point_alpha)
+
+
+def plot_point_size(args: argparse.Namespace) -> float:
+    return float(args.marker_size) if args.marker_size is not None else float(args.point_size)
+
+
+def mechanism_colors(args: argparse.Namespace) -> Dict[str, str]:
+    return {
+        "ideal": str(args.color_ideal),
+        "neg_supp_dom": str(args.color_neg_supp_dom),
+        "pos_amp_dom": str(args.color_pos_amp_dom),
+        "conf_amplified": str(args.color_conf_amplified),
+        "hn_amp_dom": str(args.color_hn_amp_dom),
+        "pos_supp_dom": str(args.color_pos_supp_dom),
+    }
+
+
 def selected_plot_rows(rows: Sequence[Mapping[str, Any]], max_points: int, seed: int) -> List[Mapping[str, Any]]:
     selected = [row for row in rows if bool(row["selected_by_threshold"])]
     if max_points <= 0 or len(selected) <= max_points:
@@ -663,21 +737,26 @@ def selected_plot_rows(rows: Sequence[Mapping[str, Any]], max_points: int, seed:
     return [selected[int(index)] for index in indices]
 
 
+def compute_shift_mechanism_masks(x: np.ndarray, y: np.ndarray, delta_m: np.ndarray) -> Dict[str, np.ndarray]:
+    return {
+        "ideal": (x < 0.0) & (y > 0.0) & (delta_m > 0.0),
+        "neg_supp_dom": (x < 0.0) & (y < 0.0) & (delta_m > 0.0),
+        "pos_amp_dom": (x > 0.0) & (y > 0.0) & (delta_m > 0.0),
+        "conf_amplified": (x > 0.0) & (y < 0.0) & (delta_m < 0.0),
+        "hn_amp_dom": (x > 0.0) & (y > 0.0) & (delta_m < 0.0),
+        "pos_supp_dom": (x < 0.0) & (y < 0.0) & (delta_m < 0.0),
+    }
+
+
 def compute_shift_mechanism_stats(x: np.ndarray, y: np.ndarray, delta_m: np.ndarray) -> Dict[str, Dict[str, Any]]:
     total = int(delta_m.size)
-    specs = [
-        ("ideal", "Ideal", (x < 0.0) & (y > 0.0) & (delta_m > 0.0)),
-        ("neg_supp_dom", "Neg-supp dom.", (x < 0.0) & (y < 0.0) & (delta_m > 0.0)),
-        ("pos_amp_dom", "Pos-amp dom.", (x > 0.0) & (y > 0.0) & (delta_m > 0.0)),
-        ("conf_amplified", "Conf. amplified", (x > 0.0) & (y < 0.0) & (delta_m < 0.0)),
-        ("hn_amp_dom", "HN amp. dom.", (x > 0.0) & (y > 0.0) & (delta_m < 0.0)),
-        ("pos_supp_dom", "Pos. supp. dom.", (x < 0.0) & (y < 0.0) & (delta_m < 0.0)),
-    ]
+    masks = compute_shift_mechanism_masks(x, y, delta_m)
     stats: Dict[str, Dict[str, Any]] = {}
-    for key, label, mask in specs:
+    for key in MECHANISM_ORDER:
+        mask = masks[key]
         count = int(np.sum(mask))
         stats[key] = {
-            "label": label,
+            "label": MECHANISM_LABELS[key],
             "count": count,
             "percent": None if total == 0 else float(count / total * 100.0),
         }
@@ -706,31 +785,52 @@ def plot_shift_decomposition(
     y_key = "delta_s_pos_norm" if normalized else "delta_s_pos"
     x = np.array([float(row[x_key]) for row in plot_rows], dtype=np.float64)
     y = np.array([float(row[y_key]) for row in plot_rows], dtype=np.float64)
-    improved = np.array([bool(row["margin_improved"]) for row in plot_rows], dtype=bool)
+    delta_m_plot = y - x
+    mechanism_masks = compute_shift_mechanism_masks(x, y, delta_m_plot)
     annotation_stats = stats_for_rows(plot_rows)
-    mechanism_stats = compute_shift_mechanism_stats(x, y, y - x)
+    mechanism_stats = compute_shift_mechanism_stats(x, y, delta_m_plot)
+    colors = mechanism_colors(args)
+    point_alpha = plot_point_alpha(args)
+    point_size = plot_point_size(args)
+    rng = np.random.default_rng(args.seed)
 
     selected_count = int(len(plot_rows))
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height))
     if len(plot_rows):
-        ax.scatter(
-            x[~improved],
-            y[~improved],
-            s=args.marker_size,
-            c="#9A665F",
-            alpha=args.alpha,
-            linewidths=0,
-            label="Delta m <= 0",
-        )
-        ax.scatter(
-            x[improved],
-            y[improved],
-            s=args.marker_size,
-            c="#4C78A8",
-            alpha=args.alpha,
-            linewidths=0,
-            label="Delta m > 0",
-        )
+        assigned = np.zeros(x.shape, dtype=bool)
+        for key in MECHANISM_DRAW_ORDER:
+            indices = np.flatnonzero(mechanism_masks[key])
+            assigned |= mechanism_masks[key]
+            if bool(args.shuffle_points) and indices.size:
+                indices = rng.permutation(indices)
+            ax.scatter(
+                x[indices],
+                y[indices],
+                s=point_size,
+                c=colors[key],
+                alpha=point_alpha,
+                edgecolors="none",
+                linewidths=0,
+                rasterized=bool(args.point_rasterized),
+                label=MECHANISM_LEGEND_LABELS[key],
+                zorder=2,
+            )
+        other = np.flatnonzero(~assigned)
+        if other.size:
+            if bool(args.shuffle_points):
+                other = rng.permutation(other)
+            ax.scatter(
+                x[other],
+                y[other],
+                s=point_size,
+                c="#BDBDBD",
+                alpha=min(point_alpha, 0.18),
+                edgecolors="none",
+                linewidths=0,
+                rasterized=bool(args.point_rasterized),
+                label="_nolegend_",
+                zorder=1,
+            )
         values = np.concatenate([x, y, np.array([0.0])])
     else:
         ax.text(0.5, 0.5, "No queries selected", transform=ax.transAxes, ha="center", va="center", fontsize=10)
@@ -744,9 +844,9 @@ def plot_shift_decomposition(
     pad = max((high - low) * 0.08, 0.01)
     limits = (low - pad, high + pad)
 
-    ax.plot(limits, limits, color="#333333", linestyle="--", linewidth=1.0, label="Delta s+ = Delta s-")
-    ax.axvline(0.0, color="#777777", linestyle=":", linewidth=0.9)
-    ax.axhline(0.0, color="#777777", linestyle=":", linewidth=0.9)
+    ax.plot(limits, limits, color=args.line_diag_color, linestyle=args.line_diag_style, linewidth=args.line_diag_width, zorder=4)
+    ax.axvline(0.0, color=args.line_zero_color, linestyle=args.line_zero_style, linewidth=args.line_zero_width, zorder=4)
+    ax.axhline(0.0, color=args.line_zero_color, linestyle=args.line_zero_style, linewidth=args.line_zero_width, zorder=4)
     ax.set_xlim(limits)
     ax.set_ylim(limits)
     ax.set_aspect("equal", adjustable="box")
@@ -772,7 +872,8 @@ def plot_shift_decomposition(
         paths["pdf_clean"] = output_dir / "shift_decomposition_clean.pdf"
         fig.savefig(paths["pdf_clean"], bbox_inches="tight")
 
-    ax.legend(frameon=False, fontsize=8, loc="best")
+    if len(plot_rows):
+        ax.legend(frameon=False, fontsize=8, loc="best", markerscale=1.4)
 
     threshold_line = (r"$\rho$ = " if normalized else "threshold = ") + f"{args.threshold:g}"
     scale_label = {"iqr": "IQR_Host", "std": "STD_Host"}.get(args.margin_scale, "raw")
