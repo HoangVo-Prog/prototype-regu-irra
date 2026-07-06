@@ -89,12 +89,12 @@ INT_COLUMNS = {
 }
 
 DEFAULT_LAYER_COLORS = {
-    "x_neg_y_pos": "#009E73",
-    "x_neg_y_neg_dm_pos": "#0072B2",
-    "x_pos_y_pos_dm_pos": "#56B4E9",
+    "x_neg_y_pos": "#008B45",
+    "x_neg_y_neg_dm_pos": "#005AB5",
+    "x_pos_y_pos_dm_pos": "#7B3294",
     "x_pos_y_neg": "#D55E00",
-    "x_pos_y_pos_dm_neg": "#CC79A7",
-    "x_neg_y_neg_dm_neg": "#E69F00",
+    "x_pos_y_pos_dm_neg": "#4D4D4D",
+    "x_neg_y_neg_dm_neg": "#E6A700",
 }
 
 DEFAULT_LAYER_ALPHA = {
